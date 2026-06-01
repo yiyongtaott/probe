@@ -23,6 +23,8 @@ import java.util.concurrent.TimeUnit;
 public class UltraLightProbe {
     private static final String SERVER_URL = "http://9.3.0.1.9.1.0.0.0.7.4.0.1.0.0.2.ip6.arpa/api/report/";
     private static final String DEVICE_ID = "notebook";
+//    private static final String DEVICE_ID = "desktop";
+//    private static final String DEVICE_ID = "phone";
 
     // ── 缓存字段（每 5 分钟刷新一次，避免高频系统调用）──
     private static volatile String cachedLanIp   = "unknown";

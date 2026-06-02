@@ -51,6 +51,8 @@
                                 <arg>--enable-url-protocols=https</arg>
                                 <arg>--no-fallback</arg>
                                 <arg>-march=compatibility</arg>
+
+                                <arg>-H:+AddAllCharsets</arg>
                             </buildArgs>
                         </configuration>
                         <executions>

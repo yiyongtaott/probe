@@ -34,6 +34,16 @@ public class UltraLightProbe {
     private static final long      CACHE_TTL_MS   = 5 * 60 * 1000; // 5 分钟
 
     public static void main(String[] args) {
+        // 1. 强行让 Java 本地打印使用 UTF-8 编码
+        System.setProperty("file.encoding", "UTF-8");
+        System.setProperty("sun.stdout.encoding", "UTF-8");
+        System.setProperty("sun.stderr.encoding", "UTF-8");
+
+        // 2. 尝试调用 Windows 命令，把当前的 CMD 窗口也切成 UTF-8 模式（防止一打开就乱码）
+        try {
+            Runtime.getRuntime().exec("cmd /c chcp 65001");
+        } catch (Exception ignored) {}
+
         System.out.println("Probe 启动成功，正在监控中...");
 
         // 后台定时刷新慢速信息（不阻塞主循环）
@@ -100,7 +110,7 @@ public class UltraLightProbe {
 
         // 标题为空时：尝试通过进程名识别系统界面
         // 获取该窗口所属进程 ID
-        IntByReference pidRef = new IntByReference();
+        IntByReference pidRef = new IntByReference(0);
         User32.INSTANCE.GetWindowThreadProcessId(hwnd, pidRef);
         int pid = pidRef.getValue();
         String processName = getProcessName(pid);

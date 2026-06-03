@@ -128,32 +128,150 @@ async function bumpUsage(env, provider) {
         return (r && r.count) || 1;
     } catch { return 0; }
 }
-
-// ── 无损合并会话 + 汇总（给 AI；每个不同活动都保留，token 大幅缩小）─────────
 function mergeSessions(rows, complete) {
+    // 【保留功能】噪声窗口：这些只是切换动画/工具栏，不代表有效活动
+    const NOISE_RE = [
+        /^任务栏[\s/／]/,
+        /^系统: /,
+        /^任务切换$/,
+        /^系统托盘/,
+        /^快速设置$/,
+        /^正在选择同类型窗口$/,
+        /^UWP 应用框架$/,
+        /^开始菜单/,
+        /^Windows 搜索$/,
+        /^任务视图/,
+        /^桌面$/,
+    ];
+    const NOISE_MAX_MS = 5000;  // 停留 >= 5s 的不视为噪声（用户真的在看）
+
+    // 【保留功能】浏览器标题归一化：提取当前激活标签页的名称
+    function normTitle(t) {
+        if (!t) return '';
+        const m1 = t.match(/^(.+?)\s+和另外\s*\d+\s*个页面/);
+        if (m1) return m1[1].trim() + ' [Edge]';
+        const m2 = t.match(/^(.+?)\s+-\s+个人\s+-\s+Microsoft/i);
+        if (m2) return m2[1].trim() + ' [Edge]';
+        return t;
+    }
+
+    function isNoise(title, dur) {
+        if (dur > NOISE_MAX_MS) return false;   // 久了就不算噪声
+        return NOISE_RE.some(re => re.test(title));
+    }
+
+    // 【保留功能】按设备分组（rows 已按 recorded_at ASC 排序）
+    const byDev = {};
+    for (const r of rows) {
+        const dev = r.device_id || '?';
+        if (!byDev[dev]) byDev[dev] = [];
+        byDev[dev].push(r);
+    }
+
+    const allSegs = [];
+    const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+
+    for (const [dev, devRows] of Object.entries(byDev)) {
+        // 为了实现30分钟内同窗口不论断续都合并，我们维护一个当前30分钟内的“窗口映射表”
+        // Key 结构: windowName
+        let activeBucketId = null;
+        let bucketSegments = {}; // 用于临时存储当前30分钟格子里的所有合并段
+
+        // 内部辅助函数：当跨越30分钟边界或遍历结束时，把当前格子里的所有合并段提交
+        function flushBucket() {
+            for (const seg of Object.values(bucketSegments)) {
+                seg._bridgeMs = 0; // 提交前重置噪声桥接内部状态
+                allSegs.push(seg);
+            }
+            bucketSegments = {};
+        }
+
+        for (const r of devRows) {
+            const end   = r.recorded_at || 0;
+            const dur   = (r.duration_ms != null) ? r.duration_ms : 0;
+            const start = (r.started_at  != null) ? r.started_at  : (end - dur);
+            const norm  = normTitle(r.window_title || '');
+            const noise = isNoise(norm, dur);
+
+            // 【新融入：30分钟对齐逻辑】
+            const currentBucketId = Math.floor(start / THIRTY_MINUTES_MS);
+            if (activeBucketId !== currentBucketId) {
+                flushBucket();
+                activeBucketId = currentBucketId;
+            }
+
+            // 处理噪声
+            if (noise) {
+                // 【保留功能】噪声挂起：如果这30分钟内有任何活动段，都为其追加桥接时长
+                for (const seg of Object.values(bucketSegments)) {
+                    seg._bridgeMs = (seg._bridgeMs || 0) + dur;
+                }
+                continue;
+            }
+
+            // 【核心重构：30分钟内断续合并】
+            if (bucketSegments[norm]) {
+                // 如果30分钟内，同一个设备上已经出现过该窗口（不论是不是连续相邻的）
+                const existing = bucketSegments[norm];
+                existing.end = Math.max(existing.end, end);
+                existing.start = Math.min(existing.start, start);
+                existing.durMs += dur + (existing._bridgeMs || 0); // 延伸时长并入噪声桥接
+                existing._bridgeMs = 0; // 清空桥接以便后续噪声继续使用
+                existing.count += 1;    // 【保留功能】原汁原味的累加计次
+            } else {
+                // 如果是这30分钟内第一次出现这个窗口，则创建新合并段
+                bucketSegments[norm] = {
+                    device: dev,
+                    window: norm,
+                    origWindow: r.window_title || '',
+                    start,
+                    end,
+                    durMs: dur,
+                    _bridgeMs: 0,
+                    count: 1,
+                };
+            }
+        }
+        // 遍历完当前设备的所有行后，记得冲刷最后一个时间格子
+        flushBucket();
+    }
+
+    // 【保留功能】多设备时按时间重新排序
+    allSegs.sort((a, b) => a.start - b.start || a.end - b.end);
+
+    // 【保留功能】构建最终输出，与你原有的前端、图表、以及AI总结所需的结构体完全无缝兼容
     const timeline = [];
     const perApp = {}, perDevice = {};
-    const buckets = { night: 0, morning: 0, afternoon: 0, evening: 0 }; // ms，上海时区
-    const lastByDev = {};
-    for (const r of rows) {
-        const dev   = r.device_id || '?';
-        const title = r.window_title || '';
-        const end   = r.recorded_at || 0;
-        const dur   = (r.duration_ms != null) ? r.duration_ms : 0;
-        const start = (r.started_at  != null) ? r.started_at  : (end - dur);
+    const buckets = { night: 0, morning: 0, afternoon: 0, evening: 0 };
 
-        const le = lastByDev[dev];
-        if (le && le.window === title) { le.end = end; le.durMs += dur; le.count += 1; }
-        else { const e = { device: dev, window: title, start, end, durMs: dur, count: 1 }; timeline.push(e); lastByDev[dev] = e; }
+    for (const seg of allSegs) {
+        timeline.push({
+            device: seg.device,
+            window: seg.window || seg.origWindow,
+            start:  seg.start,
+            end:    seg.end,
+            durMs:  seg.durMs,
+            count:  seg.count,
+        });
 
-        perApp[title]  = (perApp[title]  || 0) + dur;
-        perDevice[dev] = (perDevice[dev] || 0) + dur;
-        const h = new Date(start + 8 * 3600000).getUTCHours();   // 上海小时
-        if (h < 5) buckets.night += dur; else if (h < 12) buckets.morning += dur;
-        else if (h < 18) buckets.afternoon += dur; else buckets.evening += dur;
+        const appKey = seg.window || seg.origWindow;
+        perApp[appKey]        = (perApp[appKey]        || 0) + seg.durMs;
+        perDevice[seg.device] = (perDevice[seg.device] || 0) + seg.durMs;
+
+        // 【保留功能】上海时区时间分桶统计逻辑（傍晚、上午等）
+        const h = new Date(seg.start + 8 * 3600000).getUTCHours();
+        if      (h <  5) buckets.night     += seg.durMs;
+        else if (h < 12) buckets.morning   += seg.durMs;
+        else if (h < 18) buckets.afternoon += seg.durMs;
+        else             buckets.evening   += seg.durMs;
     }
-    return { merged: timeline, rollups: { perApp, perDevice, buckets },
-             totalSessions: rows.length, complete: !!complete };
+
+    return {
+        merged: timeline,
+        rollups: { perApp, perDevice, buckets },
+        totalSessions: rows.length,
+        complete: !!complete,
+    };
 }
 
 // ── 外部 LLM 调用（OpenAI 协议 / Google 协议）经 worker 代理 ─────────────────
@@ -1464,30 +1582,67 @@ const htmlTemplate = `<!DOCTYPE html>
                 return h + 'h' + (m % 60) + 'm';
             },
 
-            buildTimelineText(merged) {
-                return merged.map(m => {
-                    const s = this.formatChatTime(m.start);
-                    const e = this.formatChatTime(m.end);
-                    return s + ' - ' + e + ' (' + this.fmtDur(m.durMs) + ') [' + this.getDeviceName(m.device) + '] ' + m.window;
-                }).join('\\n');
-            },
+// ─── 优化后的 Timeline 文本生成器 ───
+buildTimelineText(merged) {
+    if (!merged || merged.length === 0) return '';
 
-            buildPrompt(rangeLabel, deviceNames, timelineText, rollups) {
-                const fmtRoll = (obj) => Object.entries(obj || {}).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v]) => k + ': ' + this.fmtDur(v)).join('；');
-                const b = (rollups && rollups.buckets) || {};
-                const bucketLine = '上午 ' + this.fmtDur(b.morning) + ' / 下午 ' + this.fmtDur(b.afternoon) + ' / 晚上 ' + this.fmtDur(b.evening) + ' / 凌晨 ' + this.fmtDur(b.night);
-                return '以下是用户在【' + rangeLabel + '】内，在 ' + deviceNames + ' 上的完整活动时间线（按时间顺序，每行：开始 - 结束 (时长) [设备] 窗口标题）：\\n\\n'
-                    + timelineText
-                    + '\\n\\n【按时段汇总(上海时间)】' + bucketLine
-                    + '\\n【按应用/窗口汇总】' + fmtRoll(rollups && rollups.perApp)
-                    + '\\n【按设备汇总】' + fmtRoll(rollups && rollups.perDevice)
-                    + '\\n\\n请基于以上完整数据，用中文分点总结（要结合具体时间与窗口，不要笼统）：\\n'
-                    + '1. 这段时间我把时间主要花在了哪里（各类活动大致占比）；\\n'
-                    + '2. 上午、下午、晚上分别在做什么；\\n'
-                    + '3. 一共做了哪几个主要任务（按窗口/项目归纳）；\\n'
-                    + '4. 晚上大约几点睡的（最后一段活动结束、之后长时间无活动即视为入睡）；\\n'
-                    + '5. 白天哪些时段在偷偷摸鱼（工作时段里出现的娱乐/视频/社交类窗口）。';
-            },
+    let promptText = '';
+    let lastHeader = ''; // 用于记录上一次的小标题： "YYYY/MM/DD HH点"
+
+    // 1. 确保时间线是按时间正序排列
+    const sortedTimeline = [...merged].sort((a, b) => a.start - b.start);
+
+    sortedTimeline.forEach(item => {
+        // 使用与后端相同的上海时区偏移（加 8 小时），确保时间绝对准确
+        const startDate = new Date(item.start + 8 * 3600000); 
+        
+        // 提取年/月/日 和 小时
+        const year = startDate.getUTCFullYear();
+        const month = String(startDate.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(startDate.getUTCDate()).padStart(2, '0');
+        const hour = String(startDate.getUTCHours()).padStart(2, '0');
+        
+        // 提取行内所需要的分钟和秒
+        const min = String(startDate.getUTCMinutes()).padStart(2, '0');
+        const sec = String(startDate.getUTCSeconds()).padStart(2, '0');
+
+        const currentHeader = '\\n■ ' + year + '/' + month + '/' + day + ' ' + hour + '点\\n';
+
+        // 如果跨时或跨天，另起一行小标题
+        if (currentHeader !== lastHeader) {
+            promptText += currentHeader;
+            lastHeader = currentHeader;
+        }
+
+        // 3. 提取持续时间（沿用你的 fmtDur 方法）
+        const durStr = this.fmtDur(item.durMs || (item.end - item.start));
+
+        // 4. 用单引号加号兼容风格拼装行内容
+        promptText += '  ' + min + ':' + sec + ' (' + durStr + ') [' + this.getDeviceName(item.device) + '] ' + item.window + '\\n';
+    });
+
+    return promptText;
+},
+
+// ─── 优化后的 Prompt 框架拼装 ───
+buildPrompt(rangeLabel, deviceNames, timelineText, rollups) {
+    const fmtRoll = (obj) => Object.entries(obj || {}).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v]) => k + ': ' + this.fmtDur(v)).join('；');
+    const b = (rollups && rollups.buckets) || {};
+    const bucketLine = '上午 ' + this.fmtDur(b.morning) + ' / 下午 ' + this.fmtDur(b.afternoon) + ' / 晚上 ' + this.fmtDur(b.evening) + ' / 凌晨 ' + this.fmtDur(b.night);
+    
+    // 修改了第一句的括号提示，使之与新的数据格式完全匹配，不误导 AI
+    return '以下是用户在【' + rangeLabel + '】内，在 ' + deviceNames + ' 上的完整活动时间线（按时间顺序，大标题为小时段，行内仅展示：分:秒 (时长) [设备] 窗口标题）：\\\\n'
+        + timelineText
+        + '\\\\n\\\\n【按时段汇总(上海时间)】' + bucketLine
+        + '\\\\n【按应用/窗口汇总】' + fmtRoll(rollups && rollups.perApp)
+        + '\\\\n【按设备汇总】' + fmtRoll(rollups && rollups.perDevice)
+        + '\\\\n\\\\n请基于以上完整数据，用中文分点总结（要结合具体时间与窗口，不要笼统）：\\\\n'
+        + '1. 这段时间我把时间主要花在了哪里（各类活动大致占比）；\\\\n'
+        + '2. 上午、下午、晚上分别在做什么；\\\\n'
+        + '3. 一共做了哪几个主要任务（按窗口/项目归纳）；\\\\n'
+        + '4. 晚上大约几点睡的（最后一段活动结束、之后长时间无活动即视为入睡）；\\\\n'
+        + '5. 白天哪些时段在偷偷摸鱼（工作时段里出现的娱乐/视频/社交类窗口）。';
+},
 
             async callAi(prompt) {
                 const body = { prompt, provider: this.aiProvider, model: this.aiModel };

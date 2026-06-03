@@ -1064,11 +1064,11 @@ const htmlTemplate = `<!DOCTYPE html>
                             查询
                         </button>
                         <button @click="openAiSummary"
-                                :disabled="aiLoading || historyDevices.length === 0"
+                                :disabled="aiLoading || !aiPrompt || historyDevices.length === 0"
                                 class="px-4 py-1 text-xs bg-gradient-to-r from-purple-900/40 to-pink-900/40 text-pink-300 border border-pink-700/30 rounded font-mono hover:from-purple-800/50 transition disabled:opacity-40">
                             {{ aiLoading ? 'AI 分析中...' : '✨ AI 总结' }}
                         </button>
-                        <span v-if="mergedInfo" class="text-[10px] text-slate-500 font-mono self-center">{{ mergedInfo }}</span>
+                        <span v-if="mergedInfo" :class="['text-[10px] font-mono self-center', aiForced ? 'text-rose-400' : (aiBucketMin > 30 ? 'text-amber-400' : 'text-slate-500')]">{{ mergedInfo }}</span>
                         <span class="text-[10px] text-cyan-600 font-mono self-center">今日AI已用: {{ aiUsageToday[aiProvider] || 0 }} 次<span v-if="aiProvider==='cf'"> · CF免费~1万neurons/天</span></span>
                     </div>
 
@@ -1091,7 +1091,7 @@ const htmlTemplate = `<!DOCTYPE html>
                                 <option value="@cf/meta/llama-3.1-8b-instruct">llama-3.1-8b-instruct (稳)</option>
                                 <option value="@cf/qwen/qwq-32b">qwq-32b (推理)</option>
                             </select>
-                            <div class="text-[10px] text-slate-600 mt-1" style="max-width:320px;">免费约 1万 neurons/天，够每天几十~上百次中等总结；单次建议 &lt; ~2万 token（约6万字符），超出会自动逐日总结。模型不存在会自动回退 llama-3.1-8b。</div>
+                            <div class="text-[10px] text-slate-600 mt-1" style="max-width:320px;">免费约 1万 neurons/天，够每天几十~上百次中等总结；单次建议 &lt; 60 KB（约 2万 token），超出会自动加大合并粒度（30分钟→最长6小时）压缩，仍超限则强制总结。模型不存在会自动回退 llama-3.1-8b。</div>
                         </div>
                         <template v-if="aiProvider !== 'cf'">
                             <div>
@@ -1224,8 +1224,11 @@ const htmlTemplate = `<!DOCTYPE html>
                 historyLoading: false,
                 aiLoading: false,
                 aiSummary: '',
-                aiComplete: true,
                 mergedInfo: '',
+                aiMergedData: null,   // 查询时缓存的服务端合并结果(30分钟粒度)+rollups/totalSessions/complete
+                aiPrompt: '',         // 查询时即构造并存储的最终 prompt；总结时直接复用，不再临时构造
+                aiForced: false,      // true=压缩到6小时合并仍超限，强制发送
+                aiBucketMin: 30,      // 最终采用的合并粒度(分钟)
                 aiUsageToday: {},
                 aiProvider: localStorage.getItem('fl_ai_provider') || 'cf',
                 aiModel:    localStorage.getItem('fl_ai_model')    || '@cf/qwen/qwen2.5-coder-32b-instruct',
@@ -1520,6 +1523,8 @@ const htmlTemplate = `<!DOCTYPE html>
 
                     allRows.sort((a, b) => b.recorded_at - a.recorded_at);
                     this.historyRows = allRows;
+                    // 【需求1】查询的同时拉取合并数据并构造/存储最终 prompt，使大小信息立即显示
+                    await this.prepareAiData(start, end);
                 } catch (e) {
                     console.error('loadHistory error:', e);
                 } finally {
@@ -1527,35 +1532,16 @@ const htmlTemplate = `<!DOCTYPE html>
                 }
             },
 
-            // ── 需求2：AI 总结（发送完整合并数据，绝不截断）──────────────────
+            // ── 【需求1】AI 总结：直接复用查询时已构造并存储的 prompt，不再临时构造参数 ──
             async openAiSummary() {
-                if (this.aiLoading || this.historyDevices.length === 0) return;
+                if (this.aiLoading) return;
+                if (!this.aiPrompt) { this.aiSummary = '（暂无可总结的数据，请先点击「查询」）'; return; }
                 this.aiLoading = true;
-                this.aiSummary = '';
-                this.mergedInfo = '';
+                this.aiSummary = this.aiForced ? '⚠ 数据压缩失败，正在强制总结中…' : '';
                 try {
-                    const end   = Date.now();
-                    const start = end - parseInt(this.historyRange);
-                    const devs  = this.historyDevices.join(',');
-                    const data  = await this.fetchAiData(devs, start, end);
-                    if (!data || !data.merged) { this.aiSummary = '（获取合并数据失败）'; return; }
-                    this.aiComplete = data.complete;
-
-                    const deviceNames = this.historyDevices.map(d => this.getDeviceName(d)).join('、');
-                    const rangeLabel  = { '3600000':'1小时','21600000':'6小时','86400000':'24小时','604800000':'7天','2592000000':'30天' }[this.historyRange] || '一段时间';
-                    const prompt = this.buildPrompt(rangeLabel, deviceNames, this.buildTimelineText(data.merged), data.rollups);
-                    const bytes  = new Blob([prompt]).size;
-                    const threshold = this.aiProvider === 'cf' ? 60000 : 300000;
-                    this.mergedInfo = '合并 ' + data.merged.length + ' 段 / 原始 ' + data.totalSessions + ' 条 · ' + (bytes/1024).toFixed(1) + ' KB' + (data.complete ? '' : ' · 超安全上限');
-
-                    let summary;
-                    if (data.complete && bytes <= threshold) {
-                        summary = await this.callAi(prompt);
-                    } else {
-                        this.mergedInfo += ' · 逐日总结(map-reduce)';
-                        summary = await this.mapReduceSummary(devs, start, end, deviceNames);
-                    }
-                    this.aiSummary = summary || '（未能获取总结）';
+                    const summary = await this.callAi(this.aiPrompt);
+                    const note = this.aiForced ? '⚠ 数据量过大，压缩后仍超限，已强制总结：\\n\\n' : '';
+                    this.aiSummary = note + (summary || '（未能获取总结）');
                 } catch (e) {
                     this.aiSummary = '（AI 接口请求失败: ' + e.message + '）';
                 } finally {
@@ -1582,67 +1568,125 @@ const htmlTemplate = `<!DOCTYPE html>
                 return h + 'h' + (m % 60) + 'm';
             },
 
-// ─── 优化后的 Timeline 文本生成器 ───
-buildTimelineText(merged) {
-    if (!merged || merged.length === 0) return '';
+            // ─── 【需求1】查询后即拉取合并数据并构造/存储最终 prompt（总结时直接复用）───
+            async prepareAiData(start, end) {
+                this.aiMergedData = null;
+                this.aiPrompt = '';
+                this.aiForced = false;
+                this.mergedInfo = '';
+                if (this.historyDevices.length === 0) return;
+                const devs = this.historyDevices.join(',');
+                const data = await this.fetchAiData(devs, start, end);   // 服务端 30 分钟粒度合并
+                if (!data || !data.merged) { this.mergedInfo = '（获取合并数据失败）'; return; }
+                this.aiMergedData = {
+                    merged:        data.merged,
+                    rollups:       data.rollups,
+                    totalSessions: data.totalSessions,
+                    complete:      data.complete,
+                    rangeLabel:    { '3600000':'1小时','21600000':'6小时','86400000':'24小时','604800000':'7天','2592000000':'30天' }[this.historyRange] || '一段时间',
+                    devices:       [...this.historyDevices],
+                };
+                this.preparePrompt();
+            },
 
-    let promptText = '';
-    let lastHeader = ''; // 用于记录上一次的小标题： "YYYY/MM/DD HH点"
+            // ─── 【需求2/3】自适应压缩：30分钟→最长6小时合并，按最终 prompt 的 KB 大小取舍 ───
+            preparePrompt() {
+                const base = this.aiMergedData;
+                if (!base) { this.aiPrompt = ''; this.mergedInfo = ''; return; }
+                const limitKB = this.aiProvider === 'cf' ? 60 : 300;   // 单次安全上限(KB)
+                const limit   = limitKB * 1024;
+                const steps   = [30, 60, 120, 180, 240, 300, 360];     // 合并粒度(分钟)
+                let chosen = null;
+                this.aiForced = false;
+                for (const min of steps) {
+                    const merged = (min === 30) ? base.merged : this.rebucket(base.merged, min * 60000);
+                    const prompt = this.buildPromptFromMerged(merged, base.rollups, base);
+                    const bytes  = new Blob([prompt]).size;
+                    chosen = { min, merged, prompt, bytes };
+                    if (bytes <= limit) break;
+                }
+                if (chosen.bytes > limit) this.aiForced = true;        // 连 6 小时合并都超限 -> 强制总结
+                this.aiPrompt    = chosen.prompt;
+                this.aiBucketMin = chosen.min;
 
-    // 1. 确保时间线是按时间正序排列
-    const sortedTimeline = [...merged].sort((a, b) => a.start - b.start);
+                const kb = (chosen.bytes / 1024).toFixed(1);
+                let info = '合并 ' + chosen.merged.length + ' 段 / 原始 ' + base.totalSessions + ' 条 · ' + kb + ' KB';
+                if (!base.complete) info += ' · 超安全上限';
+                if (this.aiForced) {
+                    info += ' · ⚠数据量过大，压缩至6小时合并仍超 ' + limitKB + 'KB，将强制总结';
+                } else if (chosen.min > 30) {
+                    info += ' · ⚠数据量较大，已自动按' + this.bucketLabel(chosen.min) + '合并压缩';
+                }
+                this.mergedInfo = info;
+            },
 
-    sortedTimeline.forEach(item => {
-        // 使用与后端相同的上海时区偏移（加 8 小时），确保时间绝对准确
-        const startDate = new Date(item.start + 8 * 3600000); 
-        
-        // 提取年/月/日 和 小时
-        const year = startDate.getUTCFullYear();
-        const month = String(startDate.getUTCMonth() + 1).padStart(2, '0');
-        const day = String(startDate.getUTCDate()).padStart(2, '0');
-        const hour = String(startDate.getUTCHours()).padStart(2, '0');
-        
-        // 提取行内所需要的分钟和秒
-        const min = String(startDate.getUTCMinutes()).padStart(2, '0');
-        const sec = String(startDate.getUTCSeconds()).padStart(2, '0');
+            // 把服务端 30 分钟合并段按更大粒度二次聚合（同设备/同窗口/同格子合并），无需重新查库
+            rebucket(merged, bucketMs) {
+                const map = {}, order = [];
+                for (const seg of merged) {
+                    const bid = Math.floor((seg.start || 0) / bucketMs);
+                    const key = seg.device + '|' + bid + '|' + (seg.window || '');
+                    if (map[key]) {
+                        const e = map[key];
+                        e.start = Math.min(e.start, seg.start);
+                        e.end   = Math.max(e.end, seg.end);
+                        e.durMs += seg.durMs || 0;
+                        e.count += seg.count || 0;
+                    } else {
+                        map[key] = { device: seg.device, window: seg.window, start: seg.start, end: seg.end, durMs: seg.durMs || 0, count: seg.count || 0 };
+                        order.push(key);
+                    }
+                }
+                return order.map(k => map[k]).sort((a, b) => a.start - b.start);
+            },
 
-        const currentHeader = '\\n■ ' + year + '/' + month + '/' + day + ' ' + hour + '点\\n';
+            bucketLabel(min) { return (min % 60 === 0) ? (min / 60) + '小时' : min + '分钟'; },
 
-        // 如果跨时或跨天，另起一行小标题
-        if (currentHeader !== lastHeader) {
-            promptText += currentHeader;
-            lastHeader = currentHeader;
-        }
+            devCode(id) { return ({ desktop: '台', notebook: '笔', phone: '机' })[id] || id; },
 
-        // 3. 提取持续时间（沿用你的 fmtDur 方法）
-        const durStr = this.fmtDur(item.durMs || (item.end - item.start));
+            // ─── 紧凑时间线：按天分组(■日期)，每行「时:分 时长 设备代号 窗口」，精简到极致以省体积 ───
+            buildTimelineText(merged) {
+                if (!merged || merged.length === 0) return '';
+                const TITLE_MAX = 100;
+                const sorted = [...merged].sort((a, b) => a.start - b.start);
+                let txt = '', lastDay = '';
+                for (const it of sorted) {
+                    const d   = new Date((it.start || 0) + 8 * 3600000);
+                    const day = d.getUTCFullYear() + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + String(d.getUTCDate()).padStart(2, '0');
+                    if (day !== lastDay) { txt += '\\n■' + day + '\\n'; lastDay = day; }
+                    const hh = String(d.getUTCHours()).padStart(2, '0');
+                    const mi = String(d.getUTCMinutes()).padStart(2, '0');
+                    const dur = this.fmtDur(it.durMs || (it.end - it.start));
+                    let w = it.window || '';
+                    if (w.length > TITLE_MAX) w = w.slice(0, TITLE_MAX) + '…';
+                    txt += hh + ':' + mi + ' ' + dur + ' ' + this.devCode(it.device) + ' ' + w + '\\n';
+                }
+                return txt;
+            },
 
-        // 4. 用单引号加号兼容风格拼装行内容
-        promptText += '  ' + min + ':' + sec + ' (' + durStr + ') [' + this.getDeviceName(item.device) + '] ' + item.window + '\\n';
-    });
-
-    return promptText;
-},
-
-// ─── 优化后的 Prompt 框架拼装 ───
-buildPrompt(rangeLabel, deviceNames, timelineText, rollups) {
-    const fmtRoll = (obj) => Object.entries(obj || {}).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v]) => k + ': ' + this.fmtDur(v)).join('；');
-    const b = (rollups && rollups.buckets) || {};
-    const bucketLine = '上午 ' + this.fmtDur(b.morning) + ' / 下午 ' + this.fmtDur(b.afternoon) + ' / 晚上 ' + this.fmtDur(b.evening) + ' / 凌晨 ' + this.fmtDur(b.night);
-    
-    // 修改了第一句的括号提示，使之与新的数据格式完全匹配，不误导 AI
-    return '以下是用户在【' + rangeLabel + '】内，在 ' + deviceNames + ' 上的完整活动时间线（按时间顺序，大标题为小时段，行内仅展示：分:秒 (时长) [设备] 窗口标题）：\\\\n'
-        + timelineText
-        + '\\\\n\\\\n【按时段汇总(上海时间)】' + bucketLine
-        + '\\\\n【按应用/窗口汇总】' + fmtRoll(rollups && rollups.perApp)
-        + '\\\\n【按设备汇总】' + fmtRoll(rollups && rollups.perDevice)
-        + '\\\\n\\\\n请基于以上完整数据，用中文分点总结（要结合具体时间与窗口，不要笼统）：\\\\n'
-        + '1. 这段时间我把时间主要花在了哪里（各类活动大致占比）；\\\\n'
-        + '2. 上午、下午、晚上分别在做什么；\\\\n'
-        + '3. 一共做了哪几个主要任务（按窗口/项目归纳）；\\\\n'
-        + '4. 晚上大约几点睡的（最后一段活动结束、之后长时间无活动即视为入睡）；\\\\n'
-        + '5. 白天哪些时段在偷偷摸鱼（工作时段里出现的娱乐/视频/社交类窗口）。';
-},
+            // ─── 紧凑 Prompt：设备代号图例 + 时段/应用/设备汇总，结构稳定，弱模型也能正确复盘 ───
+            buildPromptFromMerged(merged, rollups, meta) {
+                const devs = (meta && meta.devices) || this.historyDevices;
+                const devLegend   = devs.map(d => this.devCode(d) + '=' + this.getDeviceName(d)).join(' ');
+                const deviceNames = devs.map(d => this.getDeviceName(d)).join('、');
+                const rangeLabel  = (meta && meta.rangeLabel) || '一段时间';
+                const cap = (s, n) => (s && s.length > n) ? s.slice(0, n) + '…' : (s || '');
+                const fmtRoll = (obj) => Object.entries(obj || {}).sort((a, b) => b[1] - a[1]).slice(0, 15).map(([k, v]) => cap(k, 60) + ':' + this.fmtDur(v)).join('；');
+                const b = (rollups && rollups.buckets) || {};
+                const bucketLine = '上午' + this.fmtDur(b.morning) + '/下午' + this.fmtDur(b.afternoon) + '/晚上' + this.fmtDur(b.evening) + '/凌晨' + this.fmtDur(b.night);
+                return '以下是用户在【' + rangeLabel + '】内于 ' + deviceNames + ' 的完整活动时间线。\\n'
+                    + '格式：按天分组(■日期)，每行「时:分 时长 设备 窗口」；设备代号 ' + devLegend + '。\\n'
+                    + this.buildTimelineText(merged)
+                    + '\\n【时段汇总(上海)】' + bucketLine
+                    + '\\n【应用/窗口Top】' + fmtRoll(rollups && rollups.perApp)
+                    + '\\n【设备汇总】' + fmtRoll(rollups && rollups.perDevice)
+                    + '\\n\\n请基于以上完整数据，用中文分点总结（结合具体时间与窗口，不要笼统）：\\n'
+                    + '1. 时间主要花在哪（各类活动大致占比）；\\n'
+                    + '2. 上午、下午、晚上分别在做什么；\\n'
+                    + '3. 一共做了哪几个主要任务（按窗口/项目归纳）；\\n'
+                    + '4. 晚上大约几点睡（最后一段活动结束、之后长时间无活动即视为入睡）；\\n'
+                    + '5. 白天哪些时段在偷偷摸鱼（工作时段出现的娱乐/视频/社交类窗口）。';
+            },
 
             async callAi(prompt) {
                 const body = { prompt, provider: this.aiProvider, model: this.aiModel };
@@ -1655,26 +1699,6 @@ buildPrompt(rangeLabel, deviceNames, timelineText, rollups) {
                 const data = await res.json();
                 if (data.usedToday != null) this.aiUsageToday = { ...this.aiUsageToday, [this.aiProvider]: data.usedToday };
                 return data.summary || '';
-            },
-
-            async mapReduceSummary(devs, start, end, deviceNames) {
-                const DAY = 86400000;
-                const dayResults = [];
-                for (let s = start; s < end; s += DAY) {
-                    const e = Math.min(s + DAY, end);
-                    const d = await this.fetchAiData(devs, s, e);
-                    if (!d || !d.merged || d.merged.length === 0) continue;
-                    const dayLabel = this.formatChatTime(s).slice(0, 10);
-                    const p = '这是 ' + deviceNames + ' 在 ' + dayLabel + ' 一天的活动时间线（开始-结束 时长 设备 窗口）：\\n\\n'
-                        + this.buildTimelineText(d.merged)
-                        + '\\n\\n请用2-4句话客观概述这一天：主要任务、上午/下午/晚上侧重、几点睡、白天是否摸鱼。';
-                    const sum = await this.callAi(p);
-                    dayResults.push('【' + dayLabel + '】' + sum);
-                }
-                if (dayResults.length === 0) return '（该时间段无活动数据）';
-                const finalPrompt = '以下是逐日活动小结：\\n\\n' + dayResults.join('\\n\\n')
-                    + '\\n\\n请综合这些天给出整体总结：\\n1) 时间主要花在哪、各类占比；\\n2) 上午/下午/晚上规律；\\n3) 一共做了哪几个主要任务；\\n4) 通常几点睡；\\n5) 白天哪些时段摸鱼。\\n用中文，分点清晰。';
-                return await this.callAi(finalPrompt);
             },
 
             async fetchAiUsage() {
@@ -1716,6 +1740,7 @@ buildPrompt(rangeLabel, deviceNames, timelineText, rollups) {
                 if (this.aiProvider === 'google' && this.aiModel.startsWith('@cf/')) this.aiModel = 'gemini-1.5-flash';
                 this.aiModelList = [];
                 this.saveAiConfig();
+                if (this.aiMergedData) this.preparePrompt();   // 切换提供方=安全阈值变化，按缓存数据重新评估压缩
             },
         },
 

@@ -1,0 +1,30 @@
+# Cloudflare Worker 配置 — 目标是【已存在】的 Worker "blog"（FLANDRE_TIAMAT 监控）。
+# 复刻其全部现有绑定，避免部署时丢失 KV 绑定。
+
+name = "blog"
+main = "worker.js"
+account_id = "a334fcc44bf9b158b6552d913df52277"
+compatibility_date = "2026-01-09"   # 与线上保持一致
+
+# 每天 03:17 UTC 跑一次确定性清理（scheduled() -> runCleanup()）。
+[triggers]
+crons = ["17 3 * * *"]
+
+# Workers AI：env.AI
+[ai]
+binding = "AI"
+
+# D1：env.DB -> flandre-db
+[[d1_databases]]
+binding       = "DB"
+database_name = "flandre-db"
+database_id   = "89375f5b-aa47-4ff0-b62e-06035d8d0048"
+
+# 保留线上既有的两个 KV 绑定（当前代码未用，但保留以免部署时被移除）
+[[kv_namespaces]]
+binding = "CHAT_KV"
+id      = "5aeaad048a124d6d910383392d14b537"
+
+[[kv_namespaces]]
+binding = "DEVICE_KV"
+id      = "5aeaad048a124d6d910383392d14b537"

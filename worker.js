@@ -26,15 +26,189 @@ function parseProbePayload(raw) {
     try {
         const obj = JSON.parse(raw);
         return {
-            window:  obj.window  || raw,
-            lan:     obj.lan     || 'unknown',
-            wifi:    obj.wifi    || 'unknown',
-            battery: obj.battery || 'unknown',
+            window:    obj.window  || raw,
+            lan:       obj.lan     || 'unknown',
+            wifi:      obj.wifi    || 'unknown',
+            battery:   obj.battery || 'unknown',
+            start:     Number(obj.start) || 0,   // 会话开始 (epoch ms)
+            end:       Number(obj.end)   || 0,   // 会话结束 (epoch ms)
+            dur:       Number(obj.dur)   || 0,   // 时长 ms
+            keepalive: !!obj.keepalive,          // true = 仅刷新在线状态
         };
     } catch {
         // 旧版纯文本上报兼容
-        return { window: raw, lan: 'unknown', wifi: 'unknown', battery: 'unknown' };
+        return { window: raw, lan: 'unknown', wifi: 'unknown', battery: 'unknown',
+                 start: 0, end: 0, dur: 0, keepalive: false };
     }
+}
+
+// ── 定时清理（Cron Trigger 调用，确定性，取代原来的 Math.random 清理）──────────
+async function runCleanup(env) {
+    const now = Date.now();
+    const DAY = 86400000;
+
+    // activity_history 三层保留策略（数值见方案；都可调）
+    const KEEP_PER_DEVICE = 3000000;   // 每设备硬上限（~1.2GB/设备，防单设备失控）
+    const SOFT_ROWS       = 8500000;   // 全局高水位（~3.4GB / ~68% of 5GB）：开始删最老
+    const LOW_ROWS        = 7500000;   // 删到此低水位停手（~3.0GB）
+    const FLOOR_DAYS      = 1095;      // 3 年时间兜底
+    const DELETE_BUDGET   = 80000;     // 单次运行最多删多少行（护“写 10万/天”额度）
+    let budget = DELETE_BUDGET;
+
+    // 1) 时间兜底（走 idx_ah_time）
+    if (budget > 0) {
+        const r = await env.DB.prepare(
+            `DELETE FROM activity_history WHERE id IN (
+                 SELECT id FROM activity_history WHERE recorded_at < ? ORDER BY recorded_at ASC LIMIT ?)`
+        ).bind(now - FLOOR_DAYS * DAY, budget).run();
+        budget -= (r.meta && r.meta.changes) || 0;
+    }
+
+    // 2) 每设备只保留最新 N 条（走 idx_ah_dev_time，用 OFFSET 定位阈值时间）
+    const devs = await env.DB.prepare(`SELECT DISTINCT device_id FROM activity_history`).all();
+    for (const d of (devs.results || [])) {
+        if (budget <= 0) break;
+        const thr = await env.DB.prepare(
+            `SELECT recorded_at AS t FROM activity_history
+             WHERE device_id = ?1 ORDER BY recorded_at DESC LIMIT 1 OFFSET ?2`
+        ).bind(d.device_id, KEEP_PER_DEVICE).first();
+        if (thr && thr.t != null) {
+            const r = await env.DB.prepare(
+                `DELETE FROM activity_history WHERE id IN (
+                     SELECT id FROM activity_history
+                     WHERE device_id = ?1 AND recorded_at < ?2 ORDER BY recorded_at ASC LIMIT ?3)`
+            ).bind(d.device_id, thr.t, budget).run();
+            budget -= (r.meta && r.meta.changes) || 0;
+        }
+    }
+
+    // 3) 全局高水位：超阈值就按时间升序删最老，直到低于低水位（分批，受预算约束）
+    if (budget > 0) {
+        const cntRow = await env.DB.prepare(`SELECT COUNT(*) AS c FROM activity_history`).first();
+        let total = (cntRow && cntRow.c) || 0;
+        while (total > SOFT_ROWS && budget > 0) {
+            const n = Math.min(total - LOW_ROWS, budget, 50000);
+            if (n <= 0) break;
+            const r = await env.DB.prepare(
+                `DELETE FROM activity_history WHERE id IN (
+                     SELECT id FROM activity_history ORDER BY recorded_at ASC LIMIT ?)`
+            ).bind(n).run();
+            const changed = (r.meta && r.meta.changes) || 0;
+            if (changed === 0) break;
+            total -= changed; budget -= changed;
+        }
+    }
+
+    // 次要表（都很小，确定性清理）
+    await env.DB.prepare(
+        `DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY timestamp DESC LIMIT 200)`
+    ).run();
+    await env.DB.prepare(`DELETE FROM online_users WHERE last_seen < ?`).bind(now - 600000).run();
+    await env.DB.prepare(
+        `DELETE FROM devices WHERE id NOT IN ('desktop','notebook','phone') AND last_seen < ?`
+    ).bind(now - DAY).run();
+}
+
+// ── 上海日期 (YYYY-MM-DD) ───────────────────────────────────────────────────
+function shanghaiDay(ts = Date.now()) {
+    return new Date(ts + 8 * 3600000).toISOString().slice(0, 10);
+}
+
+// ── AI 使用计次（按 上海日 + provider），返回今日该 provider 的累计次数 ──────
+async function bumpUsage(env, provider) {
+    const day = shanghaiDay();
+    try {
+        await env.DB.prepare(
+            `INSERT INTO ai_usage (day, provider, count) VALUES (?, ?, 1)
+             ON CONFLICT(day, provider) DO UPDATE SET count = count + 1`
+        ).bind(day, provider).run();
+        const r = await env.DB.prepare(
+            "SELECT count FROM ai_usage WHERE day = ? AND provider = ?"
+        ).bind(day, provider).first();
+        return (r && r.count) || 1;
+    } catch { return 0; }
+}
+
+// ── 无损合并会话 + 汇总（给 AI；每个不同活动都保留，token 大幅缩小）─────────
+function mergeSessions(rows, complete) {
+    const timeline = [];
+    const perApp = {}, perDevice = {};
+    const buckets = { night: 0, morning: 0, afternoon: 0, evening: 0 }; // ms，上海时区
+    const lastByDev = {};
+    for (const r of rows) {
+        const dev   = r.device_id || '?';
+        const title = r.window_title || '';
+        const end   = r.recorded_at || 0;
+        const dur   = (r.duration_ms != null) ? r.duration_ms : 0;
+        const start = (r.started_at  != null) ? r.started_at  : (end - dur);
+
+        const le = lastByDev[dev];
+        if (le && le.window === title) { le.end = end; le.durMs += dur; le.count += 1; }
+        else { const e = { device: dev, window: title, start, end, durMs: dur, count: 1 }; timeline.push(e); lastByDev[dev] = e; }
+
+        perApp[title]  = (perApp[title]  || 0) + dur;
+        perDevice[dev] = (perDevice[dev] || 0) + dur;
+        const h = new Date(start + 8 * 3600000).getUTCHours();   // 上海小时
+        if (h < 5) buckets.night += dur; else if (h < 12) buckets.morning += dur;
+        else if (h < 18) buckets.afternoon += dur; else buckets.evening += dur;
+    }
+    return { merged: timeline, rollups: { perApp, perDevice, buckets },
+             totalSessions: rows.length, complete: !!complete };
+}
+
+// ── 外部 LLM 调用（OpenAI 协议 / Google 协议）经 worker 代理 ─────────────────
+async function callExternalLLM(provider, baseUrl, apiKey, model, sys, prompt) {
+    if (!apiKey) throw new Error('缺少 API Key');
+    if (provider === 'openai') {
+        const url = (baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '') + '/chat/completions';
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+            body: JSON.stringify({ model: model || 'gpt-4o-mini',
+                messages: [{ role: 'system', content: sys }, { role: 'user', content: prompt }] }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
+        return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+    }
+    if (provider === 'google') {
+        const base = (baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+        const m = model || 'gemini-1.5-flash';
+        const url = `${base}/models/${m}:generateContent?key=${encodeURIComponent(apiKey)}`;
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                systemInstruction: { parts: [{ text: sys }] },
+                contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
+        const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+        return parts.map(p => p.text || '').join('') || '';
+    }
+    throw new Error('未知 provider: ' + provider);
+}
+
+// ── 拉取外部可用模型列表 ─────────────────────────────────────────────────────
+async function listExternalModels(provider, baseUrl, apiKey) {
+    if (!apiKey) throw new Error('缺少 API Key');
+    if (provider === 'openai') {
+        const url = (baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '') + '/models';
+        const res = await fetch(url, { headers: { 'Authorization': 'Bearer ' + apiKey } });
+        const data = await res.json();
+        if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
+        return (data.data || []).map(m => m.id).filter(Boolean).sort();
+    }
+    if (provider === 'google') {
+        const base = (baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+        const res = await fetch(`${base}/models?key=${encodeURIComponent(apiKey)}&pageSize=200`);
+        const data = await res.json();
+        if (!res.ok) throw new Error((data.error && data.error.message) || ('HTTP ' + res.status));
+        return (data.models || []).map(m => (m.name || '').replace(/^models\//, '')).filter(Boolean).sort();
+    }
+    throw new Error('未知 provider: ' + provider);
 }
 
 export default {
@@ -58,21 +232,15 @@ export default {
 
         // [API] 核心：聚合同步接口 (Big JSON Mode)
         if (request.method === "GET" && url.pathname === "/api/sync") {
-            // 5% 概率清理 24 小时前的非白名单设备
-            if (Math.random() < 0.05) {
-                const oneDayAgo = Date.now() - 86400000;
-                ctx.waitUntil(
-                    env.DB.prepare(
-                        `DELETE FROM devices
-                         WHERE id NOT IN ('desktop', 'notebook', 'phone')
-                           AND last_seen < ?`
-                    ).bind(oneDayAgo).run()
-                );
-            }
             try {
+                // 增量拉取消息：前端带 ?since=<最大id> 时只取更新的消息，省读额度
+                const sinceId = parseInt(url.searchParams.get("since") || "0", 10);
+                const msgStmt = sinceId > 0
+                    ? env.DB.prepare("SELECT * FROM messages WHERE id > ? ORDER BY timestamp ASC LIMIT 100").bind(sinceId)
+                    : env.DB.prepare("SELECT * FROM messages ORDER BY timestamp DESC LIMIT 100");
                 const results = await env.DB.batch([
                     env.DB.prepare("SELECT * FROM devices"),
-                    env.DB.prepare("SELECT * FROM messages ORDER BY timestamp ASC LIMIT 100"),
+                    msgStmt,
                     env.DB.prepare("SELECT * FROM online_users WHERE last_seen > ?").bind(Date.now() - 300000)
                 ]);
 
@@ -124,7 +292,7 @@ export default {
             }
         }
 
-        // [API] 上报设备数据（需求3：解析 JSON payload）
+        // [API] 上报设备数据（v2：会话化，window/lan/wifi/battery + start/end/dur）
         if (request.method === "POST" && url.pathname.startsWith("/api/report/")) {
             try {
                 const deviceId = url.pathname.split("/").pop().toLowerCase();
@@ -136,7 +304,7 @@ export default {
                 const timeStr = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
                 const cfIp    = request.headers.get("CF-Connecting-IP") || "unknown";
 
-                // 更新设备状态（status 字段存 window 标题，保持兼容）
+                // 实时设备行：每次上报（含 keepalive）都刷新，保证在线状态与当前活动新鲜
                 await env.DB.prepare(
                     `INSERT INTO devices (id, status, last_seen, updated_at, last_ip, lan, wifi, battery)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -147,19 +315,16 @@ export default {
                 ).bind(deviceId, parsed.window, now, timeStr, cfIp,
                     parsed.lan, parsed.wifi, parsed.battery).run();
 
-                // 需求2：写入活动历史
-                await env.DB.prepare(
-                    `INSERT INTO activity_history (device_id, window_title, lan, wifi, battery, recorded_at)
-                     VALUES (?, ?, ?, ?, ?, ?)`
-                ).bind(deviceId, parsed.window, parsed.lan, parsed.wifi, parsed.battery, now).run();
-
-                // 5% 概率清理超过 30 天的历史，防膨胀
-                if (Math.random() < 0.05) {
-                    ctx.waitUntil(
-                        env.DB.prepare(
-                            `DELETE FROM activity_history WHERE recorded_at < ?`
-                        ).bind(now - 30 * 86400000).run()
-                    );
+                // keepalive = 仅刷新在线状态，不写历史（不增长存储）
+                if (!parsed.keepalive) {
+                    // 会话历史：recorded_at = 会话结束时刻；带起始时间与时长
+                    const recordedAt = parsed.end || now;
+                    await env.DB.prepare(
+                        `INSERT INTO activity_history
+                           (device_id, window_title, lan, wifi, battery, recorded_at, started_at, duration_ms)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+                    ).bind(deviceId, parsed.window, parsed.lan, parsed.wifi, parsed.battery,
+                           recordedAt, parsed.start || null, parsed.dur || null).run();
                 }
 
                 return createResponse("OK", 200, "text/plain");
@@ -174,25 +339,31 @@ export default {
                 const deviceId  = url.searchParams.get("device");   // 可为 all
                 const startTime = parseInt(url.searchParams.get("start") || "0");
                 const endTime   = parseInt(url.searchParams.get("end")   || String(Date.now()));
-                const limit     = Math.min(parseInt(url.searchParams.get("limit") || "500"), 1000);
+                // 键集分页(keyset)：按 (recorded_at,id) 倒序，无强制总量上限。
+                // 前端循环带 cursorTs/cursorId 翻页直到 done，即可无损取全。
+                const pageSize  = Math.min(Math.max(parseInt(url.searchParams.get("pageSize") || "2000"), 1), 5000);
+                const cursorTs  = parseInt(url.searchParams.get("cursorTs") || "0");
+                const cursorId  = parseInt(url.searchParams.get("cursorId") || "0");
 
-                let stmt;
-                if (deviceId && deviceId !== "all") {
-                    stmt = env.DB.prepare(
-                        `SELECT * FROM activity_history
-                         WHERE device_id = ? AND recorded_at BETWEEN ? AND ?
-                         ORDER BY recorded_at DESC LIMIT ?`
-                    ).bind(deviceId, startTime, endTime, limit);
-                } else {
-                    stmt = env.DB.prepare(
-                        `SELECT * FROM activity_history
-                         WHERE recorded_at BETWEEN ? AND ?
-                         ORDER BY recorded_at DESC LIMIT ?`
-                    ).bind(startTime, endTime, limit);
+                const where = [];
+                const binds = [];
+                if (deviceId && deviceId !== "all") { where.push("device_id = ?"); binds.push(deviceId); }
+                where.push("recorded_at BETWEEN ? AND ?"); binds.push(startTime, endTime);
+                if (cursorTs > 0) { where.push("(recorded_at < ? OR (recorded_at = ? AND id < ?))"); binds.push(cursorTs, cursorTs, cursorId); }
+
+                const sql = `SELECT * FROM activity_history WHERE ${where.join(" AND ")}
+                             ORDER BY recorded_at DESC, id DESC LIMIT ?`;
+                binds.push(pageSize + 1);
+                const rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
+
+                let done = true, nextTs = null, nextId = null;
+                if (rows.length > pageSize) {
+                    done = false;
+                    rows.length = pageSize;
+                    const last = rows[rows.length - 1];
+                    nextTs = last.recorded_at; nextId = last.id;
                 }
-
-                const rows = await stmt.all();
-                return createResponse(JSON.stringify({ history: rows.results }));
+                return createResponse(JSON.stringify({ history: rows, done, nextTs, nextId }));
             } catch (err) {
                 return createResponse(JSON.stringify({ error: err.message }), 500);
             }
@@ -207,10 +378,6 @@ export default {
                 await env.DB.prepare(
                     "INSERT INTO messages (user, content, timestamp, session_id) VALUES (?, ?, ?, ?)"
                 ).bind(user || "匿名", message, now, sessionId).run();
-
-                if (Math.random() < 0.1) {
-                    await env.DB.prepare("DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY timestamp DESC LIMIT 200)").run();
-                }
 
                 return createResponse(JSON.stringify({ success: true }));
             } catch (err) {
@@ -231,10 +398,6 @@ export default {
                      ON CONFLICT(session_id) DO UPDATE SET
                      last_seen=excluded.last_seen, user_name=excluded.user_name, ip=excluded.ip`
                 ).bind(sessionId, userName || "匿名", now, cfIp).run();
-
-                if (Math.random() < 0.1) {
-                    await env.DB.prepare("DELETE FROM online_users WHERE last_seen < ?").bind(now - 600000).run();
-                }
 
                 // 返回含 IP 的在线用户列表（需求4）
                 const onlineRows = await env.DB.prepare(
@@ -260,20 +423,94 @@ export default {
             }
         }
 
-        // [API] AI 总结（使用 CF Workers AI 免费额度）
+        // [API] AI 总结：provider = cf(默认) / openai / google；统一计次
         if (request.method === "POST" && url.pathname === "/api/ai-summary") {
             try {
-                const { prompt } = await request.json();
-                const result = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-                    messages: [
-                        { role: 'system', content: '你是一个简洁的个人活动分析助手，用中文回答，控制在200字以内。' },
-                        { role: 'user',   content: prompt }
-                    ],
-                    max_tokens: 400,
-                });
-                return createResponse(JSON.stringify({ summary: result.response || '' }));
+                const body     = await request.json();
+                const provider = (body.provider || 'cf').toLowerCase();
+                const prompt   = body.prompt || '';
+                const sys      = '你是客观、细致的个人活动分析助手，用中文回答。';
+
+                let summary = '';
+                if (provider === 'cf') {
+                    const model = body.model || '@cf/qwen/qwen2.5-coder-32b-instruct';
+                    const msgs  = [{ role: 'system', content: sys }, { role: 'user', content: prompt }];
+                    try {
+                        const result = await env.AI.run(model, { messages: msgs, max_tokens: 2000 });
+                        summary = result.response || '';
+                    } catch (e) {
+                        // 所选 CF 模型不可用时回退到确定可用的 llama-3.1-8b-instruct
+                        const fb = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', { messages: msgs, max_tokens: 2000 });
+                        summary = (fb.response || '') + '\n\n（注：CF 模型「' + model + '」不可用，已回退 llama-3.1-8b-instruct）';
+                    }
+                } else {
+                    summary = await callExternalLLM(provider, body.baseUrl, body.apiKey, body.model, sys, prompt);
+                }
+
+                const used = await bumpUsage(env, provider);
+                return createResponse(JSON.stringify({ summary, provider, usedToday: used }));
             } catch (err) {
-                return createResponse(JSON.stringify({ summary: '（AI 分析失败: ' + err.message + '）' }), 500);
+                return createResponse(JSON.stringify({ summary: '（AI 分析失败: ' + err.message + '）', error: err.message }), 500);
+            }
+        }
+
+        // [API] AI 合并数据：服务端无损合并区间内所有会话 + 汇总（给 AI 用，完整不截断）
+        if (request.method === "GET" && url.pathname === "/api/ai-data") {
+            try {
+                const devParam  = (url.searchParams.get("devices") || "all").toLowerCase();
+                const startTime = parseInt(url.searchParams.get("start") || "0");
+                const endTime   = parseInt(url.searchParams.get("end")   || String(Date.now()));
+                const SAFETY    = 100000;   // 安全上限(远超正常用量)；命中则 complete=false 触发前端 map-reduce
+
+                let sql, binds;
+                if (devParam && devParam !== "all") {
+                    const devs = devParam.split(",").map(s => s.trim()).filter(Boolean);
+                    const ph = devs.map(() => "?").join(",");
+                    sql = `SELECT device_id, window_title, recorded_at, started_at, duration_ms
+                           FROM activity_history
+                           WHERE device_id IN (${ph}) AND recorded_at BETWEEN ? AND ?
+                           ORDER BY recorded_at ASC LIMIT ?`;
+                    binds = [...devs, startTime, endTime, SAFETY + 1];
+                } else {
+                    sql = `SELECT device_id, window_title, recorded_at, started_at, duration_ms
+                           FROM activity_history
+                           WHERE recorded_at BETWEEN ? AND ?
+                           ORDER BY recorded_at ASC LIMIT ?`;
+                    binds = [startTime, endTime, SAFETY + 1];
+                }
+                const rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
+                const complete = rows.length <= SAFETY;
+                if (!complete) rows.length = SAFETY;
+
+                return createResponse(JSON.stringify(mergeSessions(rows, complete)));
+            } catch (err) {
+                return createResponse(JSON.stringify({ error: err.message }), 500);
+            }
+        }
+
+        // [API] 今日 AI 使用次数（按 provider）
+        if (request.method === "GET" && url.pathname === "/api/ai-usage") {
+            try {
+                const day = shanghaiDay();
+                const rows = (await env.DB.prepare(
+                    "SELECT provider, count FROM ai_usage WHERE day = ?"
+                ).bind(day).all()).results || [];
+                const usage = {};
+                rows.forEach(r => { usage[r.provider] = r.count; });
+                return createResponse(JSON.stringify({ day, usage }));
+            } catch (err) {
+                return createResponse(JSON.stringify({ day: shanghaiDay(), usage: {} }));
+            }
+        }
+
+        // [API] 拉取 OpenAI / Google 协议的可用模型列表（经 worker 代理，避开 CORS）
+        if (request.method === "POST" && url.pathname === "/api/models") {
+            try {
+                const { provider, baseUrl, apiKey } = await request.json();
+                const models = await listExternalModels((provider || '').toLowerCase(), baseUrl, apiKey);
+                return createResponse(JSON.stringify({ models }));
+            } catch (err) {
+                return createResponse(JSON.stringify({ models: [], error: err.message }), 500);
             }
         }
 
@@ -298,6 +535,11 @@ export default {
         }
 
         return new Response("Not Found", { status: 404 });
+    },
+
+    // Cron Trigger：每天定时确定性清理（见 wrangler.toml 的 crons）
+    async scheduled(event, env, ctx) {
+        await runCleanup(env);
     },
 };
 
@@ -704,10 +946,61 @@ const htmlTemplate = `<!DOCTYPE html>
                             查询
                         </button>
                         <button @click="openAiSummary"
-                                :disabled="historyRows.length === 0 || aiLoading"
+                                :disabled="aiLoading || historyDevices.length === 0"
                                 class="px-4 py-1 text-xs bg-gradient-to-r from-purple-900/40 to-pink-900/40 text-pink-300 border border-pink-700/30 rounded font-mono hover:from-purple-800/50 transition disabled:opacity-40">
                             {{ aiLoading ? 'AI 分析中...' : '✨ AI 总结' }}
                         </button>
+                        <span v-if="mergedInfo" class="text-[10px] text-slate-500 font-mono self-center">{{ mergedInfo }}</span>
+                        <span class="text-[10px] text-cyan-600 font-mono self-center">今日AI已用: {{ aiUsageToday[aiProvider] || 0 }} 次<span v-if="aiProvider==='cf'"> · CF免费~1万neurons/天</span></span>
+                    </div>
+
+                    <!-- AI 模型配置（E5/E6）-->
+                    <div class="flex flex-wrap gap-3 mb-4 items-end p-3 rounded-lg" style="background: rgba(139,92,246,0.04); border:1px solid rgba(139,92,246,0.15);">
+                        <div>
+                            <div class="text-[10px] text-slate-500 mb-1 uppercase tracking-widest">AI 提供方</div>
+                            <select v-model="aiProvider" @change="onProviderChange"
+                                    class="bg-black/40 border border-slate-700 text-slate-300 rounded px-2 py-1 text-xs font-mono">
+                                <option value="cf">CF 自带 (免费)</option>
+                                <option value="openai">OpenAI 协议</option>
+                                <option value="google">Google 协议</option>
+                            </select>
+                        </div>
+                        <div v-if="aiProvider === 'cf'">
+                            <div class="text-[10px] text-slate-500 mb-1 uppercase tracking-widest">CF 模型</div>
+                            <select v-model="aiModel" @change="saveAiConfig"
+                                    class="bg-black/40 border border-slate-700 text-slate-300 rounded px-2 py-1 text-xs font-mono">
+                                <option value="@cf/qwen/qwen2.5-coder-32b-instruct">qwen2.5-coder-32b (默认)</option>
+                                <option value="@cf/meta/llama-3.1-8b-instruct">llama-3.1-8b-instruct (稳)</option>
+                                <option value="@cf/qwen/qwq-32b">qwq-32b (推理)</option>
+                            </select>
+                            <div class="text-[10px] text-slate-600 mt-1" style="max-width:320px;">免费约 1万 neurons/天，够每天几十~上百次中等总结；单次建议 &lt; ~2万 token（约6万字符），超出会自动逐日总结。模型不存在会自动回退 llama-3.1-8b。</div>
+                        </div>
+                        <template v-if="aiProvider !== 'cf'">
+                            <div>
+                                <div class="text-[10px] text-slate-500 mb-1 uppercase tracking-widest">Base URL</div>
+                                <input v-model="aiBaseUrl" @change="saveAiConfig" :placeholder="aiProvider==='openai' ? 'https://api.openai.com/v1' : 'https://generativelanguage.googleapis.com/v1beta'"
+                                       class="bg-black/40 border border-slate-700 text-slate-300 rounded px-2 py-1 text-xs font-mono" style="width:260px;">
+                            </div>
+                            <div>
+                                <div class="text-[10px] text-slate-500 mb-1 uppercase tracking-widest">API Key</div>
+                                <input v-model="aiApiKey" @change="saveAiConfig" type="password" placeholder="sk-..."
+                                       class="bg-black/40 border border-slate-700 text-slate-300 rounded px-2 py-1 text-xs font-mono" style="width:200px;">
+                            </div>
+                            <div>
+                                <div class="text-[10px] text-slate-500 mb-1 uppercase tracking-widest">模型</div>
+                                <div class="flex gap-1">
+                                    <input v-model="aiModel" @change="saveAiConfig" list="ai-model-list" placeholder="模型名"
+                                           class="bg-black/40 border border-slate-700 text-slate-300 rounded px-2 py-1 text-xs font-mono" style="width:200px;">
+                                    <datalist id="ai-model-list">
+                                        <option v-for="m in aiModelList" :key="m" :value="m"></option>
+                                    </datalist>
+                                    <button @click="fetchModels" :disabled="aiModelsLoading"
+                                            class="px-2 py-1 text-xs bg-slate-800 text-slate-300 border border-slate-600 rounded font-mono hover:bg-slate-700 disabled:opacity-40">
+                                        {{ aiModelsLoading ? '...' : '获取模型' }}
+                                    </button>
+                                </div>
+                            </div>
+                        </template>
                     </div>
 
                     <!-- AI 总结结果 -->
@@ -805,14 +1098,24 @@ const htmlTemplate = `<!DOCTYPE html>
                     { id: 'notebook', type: 'notebook' },
                     { id: 'phone',    type: 'phone'    }
                 ],
-                // 需求2：历史面板状态
-                historyPanelOpen: false,
+                // 需求2：历史面板状态（默认展开 + 自动查 24h）
+                historyPanelOpen: true,
                 historyDevices: ['desktop', 'notebook', 'phone'],
                 historyRange: '86400000',
                 historyRows: [],
                 historyLoading: false,
                 aiLoading: false,
                 aiSummary: '',
+                aiComplete: true,
+                mergedInfo: '',
+                aiUsageToday: {},
+                aiProvider: localStorage.getItem('fl_ai_provider') || 'cf',
+                aiModel:    localStorage.getItem('fl_ai_model')    || '@cf/qwen/qwen2.5-coder-32b-instruct',
+                aiBaseUrl:  localStorage.getItem('fl_ai_baseurl')  || '',
+                aiApiKey:   localStorage.getItem('fl_ai_key')      || '',
+                aiModelList: [],
+                aiModelsLoading: false,
+                lastMsgId: 0,
             };
         },
 
@@ -955,7 +1258,8 @@ const htmlTemplate = `<!DOCTYPE html>
 
             async syncAllData() {
                 try {
-                    const res = await fetch(API_BASE + '/api/sync');
+                    const since = this.lastMsgId || 0;
+                    const res = await fetch(API_BASE + '/api/sync?since=' + since);
                     if (res.ok) {
                         const megaData = await res.json();
 
@@ -976,16 +1280,22 @@ const htmlTemplate = `<!DOCTYPE html>
                         this.rawData = newData;
                         this.lastDeviceTimestamps = { ...(newData.times || {}) };
 
-                        // 2. 聊天
-                        const messages = megaData.chatHistory;
-                        const oldCount = this.chatMessages.length;
-                        this.chatMessages = messages;
-                        if (messages.length > oldCount) {
-                            const cnt = messages.length - oldCount;
-                            if (!this.isAtBottom() || this.userScrolledUp) {
-                                this.hasNewMessages = true; this.newMessageCount += cnt;
-                            } else {
-                                this.\$nextTick(() => { this.scrollToBottom(); });
+                        // 2. 聊天（增量：since>0 只追加新消息，省读额度）
+                        const incoming = megaData.chatHistory || [];
+                        if (since === 0) {
+                            this.chatMessages = incoming;
+                        } else if (incoming.length) {
+                            this.chatMessages = [...this.chatMessages, ...incoming];
+                            if (this.chatMessages.length > 300) this.chatMessages = this.chatMessages.slice(-300);
+                        }
+                        if (incoming.length) {
+                            this.lastMsgId = Math.max(this.lastMsgId, ...incoming.map(m => m.id || 0));
+                            if (since > 0) {
+                                if (!this.isAtBottom() || this.userScrolledUp) {
+                                    this.hasNewMessages = true; this.newMessageCount += incoming.length;
+                                } else {
+                                    this.\$nextTick(() => { this.scrollToBottom(); });
+                                }
                             }
                         }
 
@@ -1064,7 +1374,7 @@ const htmlTemplate = `<!DOCTYPE html>
                 return 'log-chat';
             },
 
-            // ── 需求2：历史记录加载 ───────────────────────────────────────────
+            // ── 需求2：历史记录加载（keyset 翻页拉全，无强制 limit）──────────
             async loadHistory() {
                 if (this.historyDevices.length === 0) return;
                 this.historyLoading = true;
@@ -1075,18 +1385,21 @@ const htmlTemplate = `<!DOCTYPE html>
                     const start = end - parseInt(this.historyRange);
                     const allRows = [];
 
-                    // 分别查每个选中的设备，合并后排序
+                    // 每个设备翻页到 done，完整取回（不截断）
                     await Promise.all(this.historyDevices.map(async (dev) => {
-                        const res = await fetch(
-                            \`\${API_BASE}/api/history?device=\${dev}&start=\${start}&end=\${end}&limit=300\`
-                        );
-                        if (res.ok) {
+                        let cursorTs = 0, cursorId = 0, guard = 0;
+                        for (;;) {
+                            let u = \`\${API_BASE}/api/history?device=\${dev}&start=\${start}&end=\${end}&pageSize=5000\`;
+                            if (cursorTs > 0) u += \`&cursorTs=\${cursorTs}&cursorId=\${cursorId}\`;
+                            const res = await fetch(u);
+                            if (!res.ok) break;
                             const data = await res.json();
                             allRows.push(...(data.history || []));
+                            if (data.done || !data.nextTs || ++guard > 2000) break;
+                            cursorTs = data.nextTs; cursorId = data.nextId;
                         }
                     }));
 
-                    // 按时间倒序
                     allRows.sort((a, b) => b.recorded_at - a.recorded_at);
                     this.historyRows = allRows;
                 } catch (e) {
@@ -1096,46 +1409,158 @@ const htmlTemplate = `<!DOCTYPE html>
                 }
             },
 
-            // ── 需求2：AI 总结 ────────────────────────────────────────────────
+            // ── 需求2：AI 总结（发送完整合并数据，绝不截断）──────────────────
             async openAiSummary() {
-                if (this.historyRows.length === 0 || this.aiLoading) return;
-                this.aiLoading  = true;
-                this.aiSummary  = '';
-
-                // 构建提示词：把历史记录压缩成文本
-                const lines = this.historyRows.slice(0, 200).map(r => {
-                    const t = this.formatChatTime(r.recorded_at);
-                    return \`[\${t}] [\${this.getDeviceName(r.device_id)}] \${r.window_title}\`;
-                }).join('\\n');
-
-                const deviceNames = this.historyDevices.map(d => this.getDeviceName(d)).join('、');
-                const rangeLabel  = { '3600000':'1小时','21600000':'6小时','86400000':'24小时','604800000':'7天','2592000000':'30天' }[this.historyRange] || '一段时间';
-
-                const prompt = \`以下是用户在\${rangeLabel}内，\${deviceNames}上的活动窗口记录（时间 / 设备 / 窗口标题）：
-
-\${lines}
-
-请简洁地总结：
-1. 这段时间主要在做什么（工作、学习、娱乐？各占比如何）
-2. 各设备的使用侧重
-3. 有没有值得注意的使用规律或建议
-
-使用中文，语气轻松，控制在200字以内。\`;
-
+                if (this.aiLoading || this.historyDevices.length === 0) return;
+                this.aiLoading = true;
+                this.aiSummary = '';
+                this.mergedInfo = '';
                 try {
-                    const res = await fetch(\`\${API_BASE}/api/ai-summary\`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ prompt })
-                    });
-                    const data = await res.json();
-                    const text = data.summary || '';
-                    this.aiSummary = text || '（未能获取总结，请检查 API 连接）';
+                    const end   = Date.now();
+                    const start = end - parseInt(this.historyRange);
+                    const devs  = this.historyDevices.join(',');
+                    const data  = await this.fetchAiData(devs, start, end);
+                    if (!data || !data.merged) { this.aiSummary = '（获取合并数据失败）'; return; }
+                    this.aiComplete = data.complete;
+
+                    const deviceNames = this.historyDevices.map(d => this.getDeviceName(d)).join('、');
+                    const rangeLabel  = { '3600000':'1小时','21600000':'6小时','86400000':'24小时','604800000':'7天','2592000000':'30天' }[this.historyRange] || '一段时间';
+                    const prompt = this.buildPrompt(rangeLabel, deviceNames, this.buildTimelineText(data.merged), data.rollups);
+                    const bytes  = new Blob([prompt]).size;
+                    const threshold = this.aiProvider === 'cf' ? 60000 : 300000;
+                    this.mergedInfo = '合并 ' + data.merged.length + ' 段 / 原始 ' + data.totalSessions + ' 条 · ' + (bytes/1024).toFixed(1) + ' KB' + (data.complete ? '' : ' · 超安全上限');
+
+                    let summary;
+                    if (data.complete && bytes <= threshold) {
+                        summary = await this.callAi(prompt);
+                    } else {
+                        this.mergedInfo += ' · 逐日总结(map-reduce)';
+                        summary = await this.mapReduceSummary(devs, start, end, deviceNames);
+                    }
+                    this.aiSummary = summary || '（未能获取总结）';
                 } catch (e) {
                     this.aiSummary = '（AI 接口请求失败: ' + e.message + '）';
                 } finally {
                     this.aiLoading = false;
+                    this.fetchAiUsage();
                 }
+            },
+
+            async fetchAiData(devs, start, end) {
+                try {
+                    const res = await fetch(\`\${API_BASE}/api/ai-data?devices=\${encodeURIComponent(devs)}&start=\${start}&end=\${end}\`);
+                    if (!res.ok) return null;
+                    return await res.json();
+                } catch { return null; }
+            },
+
+            fmtDur(ms) {
+                ms = ms || 0;
+                const s = Math.round(ms / 1000);
+                if (s < 60) return s + 's';
+                const m = Math.round(s / 60);
+                if (m < 60) return m + 'm';
+                const h = Math.floor(m / 60);
+                return h + 'h' + (m % 60) + 'm';
+            },
+
+            buildTimelineText(merged) {
+                return merged.map(m => {
+                    const s = this.formatChatTime(m.start);
+                    const e = this.formatChatTime(m.end);
+                    return s + ' - ' + e + ' (' + this.fmtDur(m.durMs) + ') [' + this.getDeviceName(m.device) + '] ' + m.window;
+                }).join('\\n');
+            },
+
+            buildPrompt(rangeLabel, deviceNames, timelineText, rollups) {
+                const fmtRoll = (obj) => Object.entries(obj || {}).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v]) => k + ': ' + this.fmtDur(v)).join('；');
+                const b = (rollups && rollups.buckets) || {};
+                const bucketLine = '上午 ' + this.fmtDur(b.morning) + ' / 下午 ' + this.fmtDur(b.afternoon) + ' / 晚上 ' + this.fmtDur(b.evening) + ' / 凌晨 ' + this.fmtDur(b.night);
+                return '以下是用户在【' + rangeLabel + '】内，在 ' + deviceNames + ' 上的完整活动时间线（按时间顺序，每行：开始 - 结束 (时长) [设备] 窗口标题）：\\n\\n'
+                    + timelineText
+                    + '\\n\\n【按时段汇总(上海时间)】' + bucketLine
+                    + '\\n【按应用/窗口汇总】' + fmtRoll(rollups && rollups.perApp)
+                    + '\\n【按设备汇总】' + fmtRoll(rollups && rollups.perDevice)
+                    + '\\n\\n请基于以上完整数据，用中文分点总结（要结合具体时间与窗口，不要笼统）：\\n'
+                    + '1. 这段时间我把时间主要花在了哪里（各类活动大致占比）；\\n'
+                    + '2. 上午、下午、晚上分别在做什么；\\n'
+                    + '3. 一共做了哪几个主要任务（按窗口/项目归纳）；\\n'
+                    + '4. 晚上大约几点睡的（最后一段活动结束、之后长时间无活动即视为入睡）；\\n'
+                    + '5. 白天哪些时段在偷偷摸鱼（工作时段里出现的娱乐/视频/社交类窗口）。';
+            },
+
+            async callAi(prompt) {
+                const body = { prompt, provider: this.aiProvider, model: this.aiModel };
+                if (this.aiProvider !== 'cf') { body.baseUrl = this.aiBaseUrl; body.apiKey = this.aiApiKey; }
+                const res = await fetch(\`\${API_BASE}/api/ai-summary\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                if (data.usedToday != null) this.aiUsageToday = { ...this.aiUsageToday, [this.aiProvider]: data.usedToday };
+                return data.summary || '';
+            },
+
+            async mapReduceSummary(devs, start, end, deviceNames) {
+                const DAY = 86400000;
+                const dayResults = [];
+                for (let s = start; s < end; s += DAY) {
+                    const e = Math.min(s + DAY, end);
+                    const d = await this.fetchAiData(devs, s, e);
+                    if (!d || !d.merged || d.merged.length === 0) continue;
+                    const dayLabel = this.formatChatTime(s).slice(0, 10);
+                    const p = '这是 ' + deviceNames + ' 在 ' + dayLabel + ' 一天的活动时间线（开始-结束 时长 设备 窗口）：\\n\\n'
+                        + this.buildTimelineText(d.merged)
+                        + '\\n\\n请用2-4句话客观概述这一天：主要任务、上午/下午/晚上侧重、几点睡、白天是否摸鱼。';
+                    const sum = await this.callAi(p);
+                    dayResults.push('【' + dayLabel + '】' + sum);
+                }
+                if (dayResults.length === 0) return '（该时间段无活动数据）';
+                const finalPrompt = '以下是逐日活动小结：\\n\\n' + dayResults.join('\\n\\n')
+                    + '\\n\\n请综合这些天给出整体总结：\\n1) 时间主要花在哪、各类占比；\\n2) 上午/下午/晚上规律；\\n3) 一共做了哪几个主要任务；\\n4) 通常几点睡；\\n5) 白天哪些时段摸鱼。\\n用中文，分点清晰。';
+                return await this.callAi(finalPrompt);
+            },
+
+            async fetchAiUsage() {
+                try {
+                    const res = await fetch(\`\${API_BASE}/api/ai-usage\`);
+                    if (res.ok) { const d = await res.json(); this.aiUsageToday = d.usage || {}; }
+                } catch (e) {}
+            },
+
+            async fetchModels() {
+                if (this.aiProvider === 'cf') return;
+                if (!this.aiApiKey) { alert('请先填写 API Key'); return; }
+                this.aiModelsLoading = true;
+                try {
+                    const res = await fetch(\`\${API_BASE}/api/models\`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ provider: this.aiProvider, baseUrl: this.aiBaseUrl, apiKey: this.aiApiKey })
+                    });
+                    const d = await res.json();
+                    if (d.error) alert('获取模型失败: ' + d.error);
+                    this.aiModelList = d.models || [];
+                    if (this.aiModelList.length && !this.aiModelList.includes(this.aiModel)) this.aiModel = this.aiModelList[0];
+                    this.saveAiConfig();
+                } catch (e) { alert('获取模型失败: ' + e.message); }
+                finally { this.aiModelsLoading = false; }
+            },
+
+            saveAiConfig() {
+                localStorage.setItem('fl_ai_provider', this.aiProvider);
+                localStorage.setItem('fl_ai_model', this.aiModel);
+                localStorage.setItem('fl_ai_baseurl', this.aiBaseUrl);
+                localStorage.setItem('fl_ai_key', this.aiApiKey);
+            },
+
+            onProviderChange() {
+                if (this.aiProvider === 'cf' && !this.aiModel.startsWith('@cf/')) this.aiModel = '@cf/qwen/qwen2.5-coder-32b-instruct';
+                if (this.aiProvider === 'openai' && this.aiModel.startsWith('@cf/')) this.aiModel = 'gpt-4o-mini';
+                if (this.aiProvider === 'google' && this.aiModel.startsWith('@cf/')) this.aiModel = 'gemini-1.5-flash';
+                this.aiModelList = [];
+                this.saveAiConfig();
             },
         },
 
@@ -1152,10 +1577,14 @@ const htmlTemplate = `<!DOCTYPE html>
             }
 
             this.syncAllData();
-            this.syncInterval = setInterval(() => this.syncAllData(), 5000);
+            this.syncInterval = setInterval(() => this.syncAllData(), 10000);
 
             this.sendHeartbeat();
             this.heartbeatInterval = setInterval(() => this.sendHeartbeat(), 30000);
+
+            // E1：历史面板默认展开并自动查最近 24h；E4：拉取今日 AI 用量
+            this.loadHistory();
+            this.fetchAiUsage();
 
             setTimeout(() => {
                 this.addLog('CHAT', \`用户 \${this.userName} 加入群聊\`, 'net');

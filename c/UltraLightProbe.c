@@ -1,7 +1,11 @@
 /*
- * UltraLightProbe — native Win32 rewrite.
- * Replaces the Java/JNA/GraalVM build: no reflection (kills the IntByReference
- * crash), no subprocesses (tasklist/netsh/wmic gone), no GC. Flat ~1-2 MB RAM.
+ * UltraLightProbe — native Win32, event-driven (v2).
+ * Replaces the Java/JNA/GraalVM build: no reflection, no subprocesses, no GC.
+ * Flat ~1-2 MB RAM. Reports one row per *activity session* (window + start/end),
+ * driven by SetWinEventHook foreground events + a 30s housekeeping timer; the
+ * thread blocks in GetMessage so idle/locked time costs almost no wakeups.
+ * Sessions that fail to send go to a bounded offline ring buffer and are
+ * replayed when connectivity returns, so the server never misses activity.
  */
 #define _WIN32_WINNT 0x0601
 #define WIN32_LEAN_AND_MEAN
@@ -37,19 +41,33 @@
 #define SERVER_HOST        L"9.3.0.1.9.1.0.0.0.7.4.0.1.0.0.2.ip6.arpa"
 #define SERVER_PORT        ((INTERNET_PORT)80)
 #define SERVER_PATH        L"/api/report/" DEVICE_ID
-#define POLL_MS            3000
-#define FORCE_TICKS        600   /* 600 * 3s = 30 min forced re-send */
-#define SLOW_REFRESH_TICKS 100   /* 100 * 3s = 5 min slow-cache refresh */
+#define CHECKPOINT_MS      (30u * 60u * 1000u)   /* same window 30 min -> force checkpoint */
+#define SLOW_REFRESH_MS    (5u  * 60u * 1000u)   /* lan/wifi/battery refresh cadence       */
+#define TIMER_TICK_MS      30000u                /* housekeeping: title change / cp / flush */
+#define KEEPALIVE_MS       240000u               /* active user, same window: refresh online */
 
 /* ── Buffers (single-threaded: globals/statics, zero per-tick heap churn) ── */
 #define TITLE_CAP   1024
 #define PAYLOAD_CAP 4096
 #define BODY_CAP    16384
+#define PENDING_CAP   128     /* offline ring buffer: max queued sessions          */
+#define PENDING_ENTRY 2048    /* per-entry byte cap (over-long titles not queued)  */
 
 static wchar_t g_lan[64]      = L"unknown";
 static wchar_t g_wifi[128]    = L"unknown";
 static wchar_t g_battery[64]  = L"unknown";
 static HINTERNET g_hSession   = NULL;
+
+/* session state + offline ring buffer (single-threaded; flat, no heap churn) */
+static wchar_t   g_cur_title[TITLE_CAP] = L"";
+static ULONGLONG g_cur_start = 0;   /* epoch-ms when current window session began */
+static ULONGLONG g_last_slow = 0;   /* epoch-ms of last slow-cache refresh        */
+static ULONGLONG g_last_send = 0;   /* epoch-ms of last successful POST (any kind) */
+
+typedef struct { char data[PENDING_ENTRY]; DWORD len; } pending_t;
+static pending_t g_pending[PENDING_CAP];
+static int g_pend_head  = 0;        /* index of oldest queued entry */
+static int g_pend_count = 0;
 
 /* ── small helpers ──────────────────────────────────────────────────────── */
 static void copy_w(wchar_t *dst, size_t cap, const wchar_t *src) {
@@ -72,6 +90,14 @@ static void json_escape_w(const wchar_t *in, wchar_t *out, size_t cap) {
         out[o++] = in[i];
     }
     out[o] = L'\0';
+}
+
+/* Wall-clock milliseconds since the Unix epoch (matches JS Date.now()). */
+static ULONGLONG now_ms(void) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return t / 10000ULL - 11644473600000ULL;   /* 100ns since 1601 -> ms since 1970 */
 }
 
 /* ── process name by PID (no tasklist subprocess) ───────────────────────── */
@@ -241,67 +267,190 @@ static void refresh_slow_cache(void) {
     get_battery(g_battery, sizeof(g_battery) / sizeof(wchar_t));
 }
 
-static void build_payload(const wchar_t *title, wchar_t *out, size_t cap) {
+/* Session payload v2: window + slow-cache fields + start/end/duration (ms). */
+static void build_payload(const wchar_t *title, ULONGLONG start, ULONGLONG end,
+                          wchar_t *out, size_t cap) {
     wchar_t et[TITLE_CAP], ew[256];
     json_escape_w(title, et, TITLE_CAP);
     json_escape_w(g_wifi, ew, 256);
+    ULONGLONG dur = (end >= start) ? (end - start) : 0;
     swprintf(out, cap,
-             L"{\"window\":\"%ls\",\"lan\":\"%ls\",\"wifi\":\"%ls\",\"battery\":\"%ls\"}",
-             et, g_lan, ew, g_battery);
+             L"{\"window\":\"%ls\",\"lan\":\"%ls\",\"wifi\":\"%ls\",\"battery\":\"%ls\","
+             L"\"start\":%llu,\"end\":%llu,\"dur\":%llu}",
+             et, g_lan, ew, g_battery, start, end, dur);
 }
 
-/* ── HTTP POST (no HttpURLConnection; WinHTTP). Offline = silent return. ─── */
-static void send_data(const char *body, DWORD bodyLen) {
-    if (!g_hSession) return;
+/* ── HTTP POST (WinHTTP). Returns TRUE only on a 2xx/3xx response. ───────── */
+static BOOL send_data(const char *body, DWORD bodyLen) {
+    if (!g_hSession) return FALSE;
+    BOOL ok = FALSE;
     HINTERNET hConnect = WinHttpConnect(g_hSession, SERVER_HOST, SERVER_PORT, 0);
-    if (!hConnect) return;
+    if (!hConnect) return FALSE;
     HINTERNET hReq = WinHttpOpenRequest(hConnect, L"POST", SERVER_PATH, NULL,
                                         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
     if (hReq) {
         WinHttpSetTimeouts(hReq, 5000, 5000, 5000, 5000);
         LPCWSTR headers = L"Content-Type: application/json; charset=UTF-8\r\n";
-        if (WinHttpSendRequest(hReq, headers, (DWORD)-1L, (LPVOID)body, bodyLen, bodyLen, 0))
-            WinHttpReceiveResponse(hReq, NULL);
+        if (WinHttpSendRequest(hReq, headers, (DWORD)-1L, (LPVOID)body, bodyLen, bodyLen, 0) &&
+            WinHttpReceiveResponse(hReq, NULL)) {
+            DWORD status = 0, sz = sizeof(status);
+            if (WinHttpQueryHeaders(hReq,
+                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX))
+                ok = (status >= 200 && status < 400);
+            else
+                ok = TRUE;   /* got a response but couldn't read the code; assume sent */
+        }
         WinHttpCloseHandle(hReq);
     }
     WinHttpCloseHandle(hConnect);
+    return ok;
 }
 
-/* ── main loop ──────────────────────────────────────────────────────────── */
+/* ── offline ring buffer ────────────────────────────────────────────────── */
+static void enqueue_pending(const char *body, DWORD len) {
+    if (len == 0 || len > PENDING_ENTRY) return;   /* too big to buffer (very rare) */
+    if (g_pend_count == PENDING_CAP) {             /* full: drop the oldest         */
+        g_pend_head = (g_pend_head + 1) % PENDING_CAP;
+        g_pend_count--;
+    }
+    int idx = (g_pend_head + g_pend_count) % PENDING_CAP;
+    memcpy(g_pending[idx].data, body, len);
+    g_pending[idx].len = len;
+    g_pend_count++;
+}
+
+/* Send queued sessions oldest-first; stop at the first failure (still offline). */
+static void flush_pending(void) {
+    while (g_pend_count > 0) {
+        pending_t *p = &g_pending[g_pend_head];
+        if (!send_data(p->data, p->len)) break;
+        g_pend_head = (g_pend_head + 1) % PENDING_CAP;
+        g_pend_count--;
+    }
+}
+
+/* ── session reporting ──────────────────────────────────────────────────── */
+static void report_session(const wchar_t *title, ULONGLONG start, ULONGLONG end) {
+    wchar_t payload[PAYLOAD_CAP];
+    char    body[BODY_CAP];
+    build_payload(title, start, end, payload, PAYLOAD_CAP);
+    int n = WideCharToMultiByte(CP_UTF8, 0, payload, -1, body, BODY_CAP, NULL, NULL);
+    if (n <= 0) return;
+    DWORD len = (DWORD)(n - 1);   /* drop trailing NUL */
+    if (send_data(body, len)) {
+        g_last_send = now_ms();
+        LOGW(L"已发送: %ls\n", payload);
+        flush_pending();          /* opportunistically drain any backlog */
+    } else {
+        enqueue_pending(body, len);
+        LOGW(L"离线缓存(%d): %ls\n", g_pend_count, payload);
+    }
+}
+
+/* Liveness ping: refresh the live device row only (no history row). Sent only
+   while the user is active, so an idle/locked machine still reads offline. */
+static void send_keepalive(void) {
+    wchar_t payload[PAYLOAD_CAP], et[TITLE_CAP], ew[256];
+    char    body[BODY_CAP];
+    json_escape_w(g_cur_title, et, TITLE_CAP);
+    json_escape_w(g_wifi, ew, 256);
+    swprintf(payload, PAYLOAD_CAP,
+             L"{\"keepalive\":1,\"window\":\"%ls\",\"lan\":\"%ls\",\"wifi\":\"%ls\",\"battery\":\"%ls\"}",
+             et, g_lan, ew, g_battery);
+    int n = WideCharToMultiByte(CP_UTF8, 0, payload, -1, body, BODY_CAP, NULL, NULL);
+    if (n <= 0) return;
+    if (send_data(body, (DWORD)(n - 1))) { g_last_send = now_ms(); flush_pending(); }
+}
+
+/* Close the current session, report it, and open a new one titled newTitle. */
+static void roll_session(const wchar_t *newTitle) {
+    ULONGLONG now = now_ms();
+    if (g_cur_title[0] != L'\0' && g_cur_start != 0)
+        report_session(g_cur_title, g_cur_start, now);
+    copy_w(g_cur_title, TITLE_CAP, newTitle);
+    g_cur_start = now;
+}
+
+/* Same window held >= 30 min: emit a segment and keep the title running. */
+static void checkpoint_session(void) {
+    ULONGLONG now = now_ms();
+    if (g_cur_title[0] != L'\0' && g_cur_start != 0) {
+        report_session(g_cur_title, g_cur_start, now);
+        g_cur_start = now;
+    }
+}
+
+/* Re-read the foreground title; roll the session if it changed. */
+static void on_possible_change(void) {
+    wchar_t title[TITLE_CAP];
+    get_window_title(title, TITLE_CAP);
+    if (wcscmp(title, g_cur_title) != 0)
+        roll_session(title);
+}
+
+/* Foreground-window switch — delivered on this thread via the message loop. */
+static void CALLBACK win_event_proc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
+                                    LONG idObject, LONG idChild,
+                                    DWORD idThread, DWORD evTime) {
+    (void)hHook; (void)event; (void)hwnd; (void)idObject;
+    (void)idChild; (void)idThread; (void)evTime;
+    on_possible_change();
+}
+
+/* 30s housekeeping: same-window title changes, slow cache, checkpoint, retry. */
+static void CALLBACK timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
+    (void)hwnd; (void)msg; (void)id; (void)tick;
+    ULONGLONG now = now_ms();
+    if (now - g_last_slow >= SLOW_REFRESH_MS) { refresh_slow_cache(); g_last_slow = now; }
+    on_possible_change();                                        /* tab/title changes */
+    if (g_cur_start != 0 && now - g_cur_start >= CHECKPOINT_MS) checkpoint_session();
+    /* Active user staying in one window: keep dashboard 'online' without a history
+       row. Idle/locked => no input => no ping => correctly drops to offline. */
+    LASTINPUTINFO lii; lii.cbSize = sizeof(lii);
+    DWORD idle = GetLastInputInfo(&lii) ? (GetTickCount() - lii.dwTime) : 0;
+    if (idle < KEEPALIVE_MS && now - g_last_send >= KEEPALIVE_MS) send_keepalive();
+    flush_pending();
+}
+
+/* ── main: event-driven, blocks in GetMessage (near-zero idle wakeups) ───── */
 static void run(void) {
     HANDLE mutex = CreateMutexW(NULL, FALSE, L"Local\\UltraLightProbe_" DEVICE_ID);
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) return;  /* one instance */
 
-    g_hSession = WinHttpOpen(L"UltraLightProbe/1.0",
+    g_hSession = WinHttpOpen(L"UltraLightProbe/2.0",
                              WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 
-    LOGW(L"Probe 启动成功，正在监控中...\n");
+    refresh_slow_cache();
+    g_last_slow = now_ms();
+    g_last_send = now_ms();
 
-    wchar_t title[TITLE_CAP], payload[PAYLOAD_CAP], lastPayload[PAYLOAD_CAP];
-    char body[BODY_CAP];
-    lastPayload[0] = L'\0';
-    int forceCount = 0;
-    unsigned long tick = 0;
-
-    for (;;) {
-        if (tick % SLOW_REFRESH_TICKS == 0) refresh_slow_cache();
+    /* seed the first session from whatever is in the foreground at launch */
+    {
+        wchar_t title[TITLE_CAP];
         get_window_title(title, TITLE_CAP);
-        build_payload(title, payload, PAYLOAD_CAP);
-        forceCount++;
-
-        if (wcscmp(payload, lastPayload) != 0 || forceCount > FORCE_TICKS) {
-            forceCount = 0;
-            int n = WideCharToMultiByte(CP_UTF8, 0, payload, -1, body, BODY_CAP, NULL, NULL);
-            if (n > 0) {
-                send_data(body, (DWORD)(n - 1));  /* drop trailing NUL */
-                copy_w(lastPayload, PAYLOAD_CAP, payload);
-                LOGW(L"已发送: %ls\n", payload);
-            }
-        }
-        Sleep(POLL_MS);
-        tick++;
+        copy_w(g_cur_title, TITLE_CAP, title);
+        g_cur_start = now_ms();
     }
+
+    LOGW(L"Probe v2 启动成功，事件驱动监控中...\n");
+
+    HWINEVENTHOOK hook = SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+        NULL, win_event_proc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    UINT_PTR timer = SetTimer(NULL, 0, TIMER_TICK_MS, timer_proc);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (timer) KillTimer(NULL, timer);
+    if (hook)  UnhookWinEvent(hook);
 }
 
 #ifdef CONSOLE_BUILD

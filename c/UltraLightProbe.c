@@ -2,7 +2,7 @@
  * UltraLightProbe — native Win32, event-driven (v2).
  * Replaces the Java/JNA/GraalVM build: no reflection, no subprocesses, no GC.
  * Flat ~1-2 MB RAM. Reports one row per *activity session* (window + start/end),
- * driven by SetWinEventHook foreground events + a 30s housekeeping timer; the
+ * driven by SetWinEventHook foreground events + a 120s housekeeping timer; the
  * thread blocks in GetMessage so idle/locked time costs almost no wakeups.
  * Sessions that fail to send go to a bounded offline ring buffer and are
  * replayed when connectivity returns, so the server never misses activity.
@@ -21,6 +21,7 @@
 #include <wctype.h>
 #include <string.h>
 #include <stdlib.h>
+#include <shellapi.h>
 
 #ifdef CONSOLE_BUILD
 #include <stdio.h>
@@ -35,15 +36,17 @@
 #pragma comment(lib, "wlanapi.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
 
 /* ── Configuration (single source of truth) ─────────────────────────────── */
+/* DEVICE_ID is the default; overridden at runtime by exe name or --device arg.
+   Exe name "desktop" -> desktop, else notebook. Phone/customers use --device. */
 #define DEVICE_ID          L"notebook"
 #define SERVER_HOST        L"9.3.0.1.9.1.0.0.0.7.4.0.1.0.0.2.ip6.arpa"
 #define SERVER_PORT        ((INTERNET_PORT)80)
-#define SERVER_PATH        L"/api/report/" DEVICE_ID
 #define CHECKPOINT_MS      (30u * 60u * 1000u)   /* same window 30 min -> force checkpoint */
 #define SLOW_REFRESH_MS    (5u  * 60u * 1000u)   /* lan/wifi/battery refresh cadence       */
-#define TIMER_TICK_MS      30000u                /* housekeeping: title change / cp / flush */
+#define TIMER_TICK_MS      120000u               /* housekeeping: title change / cp / flush */
 #define KEEPALIVE_MS       240000u               /* active user, same window: refresh online */
 
 /* ── Buffers (single-threaded: globals/statics, zero per-tick heap churn) ── */
@@ -68,6 +71,11 @@ typedef struct { char data[PENDING_ENTRY]; DWORD len; } pending_t;
 static pending_t g_pending[PENDING_CAP];
 static int g_pend_head  = 0;        /* index of oldest queued entry */
 static int g_pend_count = 0;
+
+/* Runtime device_id: detected from exe name, or overridden via --device <id>.
+   g_server_path is set once at startup and used in send_data(). */
+static wchar_t g_device_id[24]  = L"notebook";   /* default */
+static wchar_t g_server_path[96] = L"";           /* /api/report/<device_id> */
 
 /* ── small helpers ──────────────────────────────────────────────────────── */
 static void copy_w(wchar_t *dst, size_t cap, const wchar_t *src) {
@@ -98,6 +106,56 @@ static ULONGLONG now_ms(void) {
     GetSystemTimeAsFileTime(&ft);
     ULONGLONG t = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
     return t / 10000ULL - 11644473600000ULL;   /* 100ns since 1601 -> ms since 1970 */
+}
+
+/* Detect device_id from executable name or --device command-line argument.
+   Exe name convention: probe-<device_id>.exe  (last "-" suffix = device_id)
+     probe.exe              -> notebook (default)
+     probe-notebook.exe     -> notebook
+     probe-desktop.exe      -> desktop
+     probe-anything.exe     -> anything
+   Override: probe.exe --device phone                                    */
+static void init_device_id(void) {
+    /* 1) try --device <id> command-line override */
+    int argc;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        for (int i = 1; i < argc - 1; i++) {
+            if (wcscmp(argv[i], L"--device") == 0 && argv[i + 1][0]) {
+                copy_w(g_device_id, 24, argv[i + 1]);
+                LocalFree(argv);
+                swprintf(g_server_path, 96, L"/api/report/%ls", g_device_id);
+                LOGW(L"Device ID: %ls (from --device arg)\n", g_device_id);
+                return;
+            }
+        }
+        LocalFree(argv);
+    }
+
+    /* 2) detect from exe filename:   probe-<device_id>.exe  -> <device_id> */
+    wchar_t path[MAX_PATH];
+    DWORD sz = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (sz > 0 && sz < MAX_PATH) {
+        const wchar_t *base = wcsrchr(path, L'\\');
+        base = base ? base + 1 : path;
+
+        /* strip .exe suffix */
+        wchar_t stem[MAX_PATH];
+        wcsncpy(stem, base, MAX_PATH - 1);
+        stem[MAX_PATH - 1] = L'\0';
+        wchar_t *dot = wcsrchr(stem, L'.');
+        if (dot) *dot = L'\0';
+
+        /* find the last '-' */
+        wchar_t *dash = wcsrchr(stem, L'-');
+        if (dash && dash[1]) {
+            copy_w(g_device_id, 24, dash + 1);
+        }
+        /* else: keep default "notebook" */
+    }
+
+    swprintf(g_server_path, 96, L"/api/report/%ls", g_device_id);
+    LOGW(L"Device ID: %ls (from exe name)\n", g_device_id);
 }
 
 /* ── process name by PID (no tasklist subprocess) ───────────────────────── */
@@ -286,7 +344,7 @@ static BOOL send_data(const char *body, DWORD bodyLen) {
     BOOL ok = FALSE;
     HINTERNET hConnect = WinHttpConnect(g_hSession, SERVER_HOST, SERVER_PORT, 0);
     if (!hConnect) return FALSE;
-    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"POST", SERVER_PATH, NULL,
+    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"POST", g_server_path, NULL,
                                         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
     if (hReq) {
         WinHttpSetTimeouts(hReq, 5000, 5000, 5000, 5000);
@@ -398,7 +456,39 @@ static void CALLBACK win_event_proc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
     on_possible_change();
 }
 
-/* 30s housekeeping: same-window title changes, slow cache, checkpoint, retry. */
+/* Browser tab switch: catch window-title changes (Edge, Chrome, Firefox, etc.).
+   Only fires when the foreground window's title changes, so it captures in-tab
+   navigation with zero latency. Still fully event-driven — no extra wakeups. */
+static void CALLBACK win_event_namechange_proc(HWINEVENTHOOK hHook, DWORD event, HWND hwnd,
+                                                LONG idObject, LONG idChild,
+                                                DWORD idThread, DWORD evTime) {
+    (void)hHook; (void)event; (void)idThread; (void)evTime;
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) return;
+    if (!hwnd || !IsWindowVisible(hwnd)) return;
+    if (hwnd != GetForegroundWindow()) return;   /* only care about the active window */
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    wchar_t name[MAX_PATH];
+    if (!get_process_name(pid, name, MAX_PATH)) return;
+
+    wchar_t lp[MAX_PATH];
+    to_lower_w(name, lp, MAX_PATH);
+    /* Known browsers — any process whose image name matches */
+    static const wchar_t * const browsers[] = {
+        L"chrome", L"msedge", L"firefox", L"opera",
+        L"brave", L"vivaldi", L"browse", L"iexplore",
+        L"thorium", L"waterfox", L"palemoon", L"seamonkey"
+    };
+    for (int i = 0; i < (int)(sizeof(browsers)/sizeof(browsers[0])); i++) {
+        if (wcsstr(lp, browsers[i])) {
+            on_possible_change();
+            return;
+        }
+    }
+}
+
+/* 120s housekeeping: same-window title changes, slow cache, checkpoint, retry. */
 static void CALLBACK timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     (void)hwnd; (void)msg; (void)id; (void)tick;
     ULONGLONG now = now_ms();
@@ -415,7 +505,11 @@ static void CALLBACK timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
 
 /* ── main: event-driven, blocks in GetMessage (near-zero idle wakeups) ───── */
 static void run(void) {
-    HANDLE mutex = CreateMutexW(NULL, FALSE, L"Local\\UltraLightProbe_" DEVICE_ID);
+    init_device_id();  /* detect device_id from exe name or --device arg */
+
+    wchar_t mutex_name[64];
+    swprintf(mutex_name, 64, L"Local\\UltraLightProbe_%ls", g_device_id);
+    HANDLE mutex = CreateMutexW(NULL, FALSE, mutex_name);
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) return;  /* one instance */
 
     g_hSession = WinHttpOpen(L"UltraLightProbe/2.0",
@@ -436,9 +530,14 @@ static void run(void) {
 
     LOGW(L"Probe v2 启动成功，事件驱动监控中...\n");
 
-    HWINEVENTHOOK hook = SetWinEventHook(
+    HWINEVENTHOOK hook_fg = SetWinEventHook(
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
         NULL, win_event_proc, 0, 0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    HWINEVENTHOOK hook_name = SetWinEventHook(
+        EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE,
+        NULL, win_event_namechange_proc, 0, 0,
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     UINT_PTR timer = SetTimer(NULL, 0, TIMER_TICK_MS, timer_proc);
@@ -450,11 +549,12 @@ static void run(void) {
     }
 
     if (timer) KillTimer(NULL, timer);
-    if (hook)  UnhookWinEvent(hook);
+    if (hook_name) UnhookWinEvent(hook_name);
+    if (hook_fg)  UnhookWinEvent(hook_fg);
 }
 
 #ifdef CONSOLE_BUILD
-int wmain(void) {
+int main(void) {
     SetConsoleOutputCP(CP_UTF8);
     _setmode(_fileno(stdout), _O_U8TEXT);
     run();

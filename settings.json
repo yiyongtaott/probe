@@ -1,11 +1,11 @@
 {
   "env": {
     "ANTHROPIC_AUTH_TOKEN": "sk-bvZdphagAXdvFKy4tyJySVwVy3Ukf1ZyVXzKUJ9vkC2WA467",
-    "ANTHROPIC_BASE_URL": "http://localhost:3000",
-    "ANTHROPIC_MODEL": "claude-opus-4-8[1m]",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-8[1m]",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-opus-4-8[1m]",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-opus-4-8[1m]",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3000",
+    "ANTHROPIC_MODEL": "deepseek-v4-flash-free[1m]",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-flash-free[1m]",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-flash-free[1m]",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash-free[1m]",
     "OTEL_LOG_RAW_API_BODIES": "file:/tmp/claude-api.log",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "CLAUDE_CODE_DEBUG_LOG_LEVEL": "debug",
@@ -14,7 +14,7 @@
   "permissions": {
     "defaultMode": "bypassPermissions"
   },
-  "model": "opus[1m]",
+  "model": "deepseek-v4-flash-free[1m][1m]",
   "effortLevel": "high",
   "skipDangerousModePermissionPrompt": true
 }

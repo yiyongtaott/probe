@@ -1,0 +1,28 @@
+[2026-06-06] 工作流任务全部完成
+
+✅ 1. C Probe 修改
+   - init_device_id() 运行时设备ID检测（exe名 → "desktop"="desktop", 其他→"notebook", --device phone 覆盖）
+   - g_server_path 动态构建 POST 路径
+   - EVENT_OBJECT_NAMECHANGE Hook 捕获浏览器标签切
+   - 120s 兜底定时器（原30s）
+   - shell32.lib 链接
+
+✅ 2. 编译三个变体
+   - probe.exe (notebook) → 142KB ✅
+   - probe-desktop.exe (desktop) → 142KB ✅
+   - probe-console.exe (debug/notebook) → 158KB ✅
+   全部部署到根目录 + bin/
+
+✅ 3. Flutter 对齐 C Probe
+   - 连续循环间隔 30s → 120s (TIMER_TICK_MS 对齐)
+   - 240s keepalive 节流 (KEEPALIVE_MS 对齐)
+   - payload 字段完全一致
+   - flutter analyze → No issues found ✅
+
+✅ 4. 端到端测试
+   - CF Workers 端点可达 ✅
+   - notebook report payload → CF 正确接收 ✅
+   - desktop keepalive payload → CF 正确接收 ✅
+   - 设备ID自动检测验证:
+     "probe-console.exe" → device_id="notebook" ✅
+     "probe-desktop-test.exe" → device_id="desktop" ✅

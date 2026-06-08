@@ -1,5 +1,5 @@
 name: probe_app
-description: "UltraLightProbe - 三端活动监控 (静默上报 + 全功能 UI)"
+description: "UltraLightProbe - 三端活动监控"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -9,29 +9,25 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8
 
   # HTTP / API
   http: ^1.2.0
 
+  # WebView（App B 前端）
+  webview_flutter: ^4.10.0
+
   # 后台周期性任务
   workmanager: ^0.5.2
 
-  # 前台常驻服务（Android，可选，更频繁上报）
+  # 前台常驻服务（Android）
   flutter_background_service: ^5.0.0
 
   # 硬件信息
   battery_plus: ^6.0.0
   network_info_plus: ^6.0.0
 
-  # 本地存储（配置 / 离线缓存）
+  # 本地存储
   shared_preferences: ^2.3.0
-
-  # 状态管理（App B 用）
-  flutter_riverpod: ^2.5.0
-
-  # 路由（App B 用）
-  go_router: ^14.0.0
 
 dev_dependencies:
   flutter_test:

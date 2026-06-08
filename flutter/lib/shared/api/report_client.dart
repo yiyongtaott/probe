@@ -33,7 +33,7 @@ class ReportClient {
         'dur': dur,
       };
       final uri = _api.uri('/api/report/$deviceId');
-      final res = await _http.post(uri, body: jsonEncode(body));
+      final res = await _http.post(uri, body: jsonEncode(body), headers: {'Content-Type': 'application/json'});
       return res.statusCode == 200;
     } catch (_) {
       return false;
@@ -57,7 +57,7 @@ class ReportClient {
         'battery': battery,
       };
       final uri = _api.uri('/api/report/$deviceId');
-      final res = await _http.post(uri, body: jsonEncode(body));
+      final res = await _http.post(uri, body: jsonEncode(body), headers: {'Content-Type': 'application/json'});
       return res.statusCode == 200;
     } catch (_) {
       return false;

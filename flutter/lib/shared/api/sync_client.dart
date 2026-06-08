@@ -1,5 +1,6 @@
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import '../models/models.dart';
 
 /// GET /api/sync?since=N — 聚合同步接口
 class SyncClient {
@@ -18,25 +19,4 @@ class SyncClient {
     }
     throw Exception('Sync failed: ${res.statusCode}');
   }
-}
-
-class SyncPayload {
-  final Map<String, dynamic> devices;
-  final List<Map<String, dynamic>> chatHistory;
-  final int onlineCount;
-  final Map<String, dynamic> onlineUsers;
-
-  const SyncPayload({
-    required this.devices,
-    required this.chatHistory,
-    required this.onlineCount,
-    required this.onlineUsers,
-  });
-
-  factory SyncPayload.fromJson(Map<String, dynamic> json) => SyncPayload(
-        devices: json['deviceData'] ?? {},
-        chatHistory: List<Map<String, dynamic>>.from(json['chatHistory'] ?? []),
-        onlineCount: json['onlineCount'] ?? 0,
-        onlineUsers: json['onlineUsers'] ?? {},
-      );
 }

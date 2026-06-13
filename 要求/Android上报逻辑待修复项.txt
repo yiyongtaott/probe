@@ -1,0 +1,173 @@
+# Android Flutter APK 上报逻辑待修复项
+> 生成时间：2026-06-13
+> 对比基准：C UltraLightProbe (UltraLightProbe.c)
+
+---
+
+## 一、问题清单
+
+### 【P0】无 idle/息屏检测，息屏后仍持续发 keepalive
+
+**描述：**
+- C Probe：通过 `GetLastInputInfo` 判断用户 idle > 240s 则不发送 keepalive，空闲机器在服务器上正确标记为离线。
+- Flutter APK：`_maybeKeepalive` 只看距离上次 keepalive 的时长（240s），不看用户是否活跃。手机息屏放口袋后 keepalive 仍不断发送。
+
+**后果：** 服务器上设备状态永远在线，无法区分闲置/活跃。
+
+**要求：**
+- Dart ReporterService._maybeKeepalive() 增加用户活跃状态检测。Android 上需监听 `ACTION_SCREEN_OFF` / `ACTION_USER_PRESENT` / `ACTION_SCREEN_ON` 广播，或通过 PowerManager 检测屏幕状态。
+- 息屏/关机/Doze 状态下 **停止发送 keepalive**，息屏期间不应产生虚假活跃记录。
+- 登录后恢复 keepalive。
+
+---
+
+### 【P0】无锁屏/息屏识别，产生虚假活跃数据
+
+**描述：**
+- C Probe：锁屏时识别窗口为"锁屏界面"，关闭前一个 app 的 session 记录实际时间，打开 lock screen session。
+- Flutter APK：无锁屏检测。手机关屏后，`getForegroundApp()` 回退到 UsageStats 最后一条前台事件，客户端继续上报旧的最后使用 app。
+
+**后果：** 息屏期间持续上报最后使用过的 app，显示用户在持续活跃。
+
+**要求：**
+- 在 DeviceInfo.getForegroundApp() 或 ReporterService.onWake() 中检测锁屏/息屏状态。
+- 锁屏时应生成一条 "系统锁屏" 的 session 上报（与 C Probe 对齐），息屏期间不走正常 app 上报流程。
+- 识别方案：监听 `ACTION_SCREEN_OFF`，检测 `KeyguardManager.isKeyguardLocked()`。
+
+---
+
+### 【P0】轮询式架构导致 120s 内的快速切换全丢
+
+**描述：**
+- C Probe：WinEventHook 事件驱动，app 切换瞬间就触发 `roll_session()` 上报，零延迟，零丢失。
+- Flutter APK：Dart 侧每 120s 轮询一次前台 app。1 分钟内浏览 10 个 app/标题 → 只发最后检测到的 1 条，中间 9 条全丢。
+
+**后果：** 快速切换场景下上报数据严重不准，信息丢失率可达 90%。
+
+**要求：**
+- 将 android app 切换检测模式从轮询改为事件驱动。
+  - 方案 A：ProbeAccessibilityService.onAccessibilityEvent() 中通过 EventChannel/MethodChannel 实时推送 windowChange 事件到 Dart 层，ReporterService 收到事件立即处理。
+  - 方案 B：Dart 侧监听持久化文件变化（File watcher），而不是定时读取。
+- 静态上报依然保留定时器兜底（keepalive/checkpoint）。
+
+---
+
+### 【P0】OfflineCache 无上限，长期断网可能撑爆存储
+
+**描述：**
+- C Probe：`PENDING_CAP = 128`，每个 entry 最多 2KB，总上限 ~256KB，队列满了丢弃最旧。
+- Flutter APK：`OfflineCache._queue` 是 `List`，无任何大小限制。断网数小时/天可积累数千条。SharedPreferences 存储上限约 2MB，超出后持久化失败或数据全部丢失。
+
+**后果：** 极端情况下队列无限增长，导致 app 异常或数据全丢。
+
+**要求：**
+- OfflineCache 增加容量上限：建议最多 200 条（每条约 500B ~ 1KB，总上限 ~200KB）。
+- 队列满时丢弃最旧条目（FIFO 丢弃策略）。
+- 在 enqueue() 前检查队列大小。
+
+---
+
+### 【P1】WorkManager + 前台 Service 双路径存在数据竞争
+
+**描述：**
+- Android 上同时存在两条路径：前台 Service（每 120s `Timer.periodic`）和 WorkManager（每 15min `registerPeriodicTask`）。
+- 两者都调 `onWake()`，都读写 `OfflineCache._queue` + SharedPreferences。
+- WorkManager 有 `NetworkType.connected` 约束（断网时不跑），前台 Service 无此约束。
+
+**后果：**
+- 两个路径可能同时操作 SharedPreferences 持久化，偶发数据竞争。
+- 前台 Service 不影响 WorkManager 的任务执行和写入。
+
+**要求：**
+- 审查双路径是否可以合并（前台 Service 已覆盖所有功能，WorkManager 可降级为容灾 fallback）。
+- 若保留双路径，OfflineCache 的读写方法需加锁。
+
+---
+
+### 【P1】有网状态下 keepalive 不断刷，但不上报
+
+**描述：**
+- C Probe：keepalive 和 report 发送逻辑独立。
+- Flutter APK：keepalive 发送成功但不触发离线队列刷出(`autoFlush`)。`_sendKeepalive()` 成功时不调 `flush_pending()`。
+
+**后果：** 离线队列只能靠每次 onWake 的最后 `autoFlush` 刷出，延迟增加，断网恢复后吞吐低。
+
+**要求：**
+- keepalive 发送成功后触发一次离线队列刷出（与 C Probe 的 `flush_pending()` 对齐）。
+- 实现方式：`_sendKeepalive()` 返回 true 后调用 `OfflineCache.autoFlush()`。
+
+---
+
+### 【P1】同 app 内标题变化（浏览器标签切换）完全漏报
+
+**描述：**
+- C Probe：通过 `EVENT_OBJECT_NAMECHANGE` 监听窗口标题变化，浏览器标签切换时实时上报。
+- Flutter APK：`_queryAndroidForegroundWindow()` 从 UsageStats 只能拿 packageName，看不到页面的具体标题/网址信息。
+
+**后果：** 浏览器的标签切换在数据上完全不可见。
+
+**要求：**
+- 在 ProbeAccessibilityService 的文本采集基础上，当浏览器类 app 切换到前台时，尝试从窗格标题中提取页面的具体标题。
+- 推送到 Dart 侧时使用页面标题而非仅包名。
+
+---
+
+### 【P2】cacheRefreshMs 定义但未使用
+
+**描述：**
+- `ReporterService` 第 29 行定义了 `cacheRefreshMs = 5 * 60 * 1000`，但代码中无任何地方引用。
+- 当前每次 `_sendReport`/`_sendKeepalive` 都重新获取 lan/wifi/battery，相当于实时获取（但使用了各平台的插件调用）。
+
+**后果：** 不影响功能，但代码有迷惑的 dead code。此外电池和WiFi的实时获取会有额外的调用开销。
+
+**要求：**
+- 按设计意图实现 slow cache：上次缓存时间 +5min 内不重新获取网络/电池信息，超过才刷新。
+- 或者删除未使用的定义。
+
+---
+
+### 【P2】HTTP 超时与 C Probe 不一致
+
+**描述：**
+- C Probe：`WinHttpSetTimeouts` 5s
+- Flutter APK：`.timeout(Duration(seconds: 12))`
+
+**后果：** 两边超时策略不同，维护时需要记住差别。
+
+**要求：**
+- 统一超时值为 10s（Android 后台环境网络延迟较高，不宜用 5s，建议统一为 10s）。
+
+---
+
+### 【P2】Keepalive 不缓存，有网后不补发
+
+**描述：**
+- C Probe：keepalive 失败也不缓存（与 Flutter 一致）。
+- Flutter APK：keepalive 失败只是 log，从不重试补齐。
+
+**后果：** keepalive 不是强可靠的，但 C Probe 因有 idle 检测 keepalive 量少且成功率高，Flutter 的无 idle keepalive量 多但丢失更多。
+
+**要求：**
+- keepalive 仍然不缓存（与 C 对齐），但要控制 keepalive 的发送时机（见 P0 的 idle 检测）。
+
+---
+
+## 二、优先级建议
+
+| 优先级 | 问题 | 修复影响 |
+|--------|------|---------|
+| P0 | idle/息屏检测 | 修复数据真实性核心缺陷 |
+| P0 | 锁屏/息屏识别 | 修复虚假活跃数据 |
+| P0 | 轮询→事件驱动 | 修复快速切换漏报 |
+| P0 | OfflineCache 无上限 | 防止极端情况崩溃 |
+| P1 | 双路径竞争 | 提高稳定性 |
+| P1 | keepalive 触发 flush | 提高断网恢复速度 |
+| P1 | 浏览器标签切换漏报 | 功能完善 |
+| P2 | dead code 清理 | 代码整洁 |
+| P2 | 超时对齐 | 配置统一 |
+| P2 | keepalive 优化 | 小优化 |
+
+## 三、核心优化目标
+
+修复后，Flutter APK 在上报完整性、息屏处理、离线容错三方面与 C Probe 对齐，并保留 Flutter 特有的
+持久化离线队列优势（SharedPreferences 跨进程/跨重启保存）。

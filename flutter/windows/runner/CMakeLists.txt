@@ -6,14 +6,22 @@ project(runner LANGUAGES CXX)
 # work.
 #
 # Any new source files that you add to the application should be added here.
+set(PROBE_NATIVE_SOURCE "${CMAKE_SOURCE_DIR}/../../c/UltraLightProbe.c")
+
 add_executable(${BINARY_NAME} WIN32
   "flutter_window.cpp"
   "main.cpp"
   "utils.cpp"
   "win32_window.cpp"
+  "${PROBE_NATIVE_SOURCE}"
   "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
   "Runner.rc"
   "runner.exe.manifest"
+)
+
+set_source_files_properties("${PROBE_NATIVE_SOURCE}" PROPERTIES
+  COMPILE_DEFINITIONS "PROBE_EMBEDDED"
+  COMPILE_OPTIONS "/utf-8"
 )
 
 # Apply the standard set of build settings. This can be removed for applications
@@ -34,6 +42,7 @@ target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
 # dependencies here.
 target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
 target_link_libraries(${BINARY_NAME} PRIVATE "dwmapi.lib")
+target_link_libraries(${BINARY_NAME} PRIVATE "winhttp.lib" "iphlpapi.lib" "wlanapi.lib" "user32.lib" "shell32.lib")
 target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
 
 # Run the Flutter tool portions of the build. This must not be removed.

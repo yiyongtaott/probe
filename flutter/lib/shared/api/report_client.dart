@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'api_client.dart';
+import '../utils/probe_log.dart';
 
 /// POST /api/report/{device_id}
 class ReportClient {
@@ -33,9 +34,28 @@ class ReportClient {
         'dur': dur,
       };
       final uri = _api.uri('/api/report/$deviceId');
-      final res = await _http.post(uri, body: jsonEncode(body), headers: {'Content-Type': 'application/json'});
-      return res.statusCode == 200;
-    } catch (_) {
+      final encoded = jsonEncode(body);
+      final res = await _http
+          .post(
+            uri,
+            body: encoded,
+            headers: {'Content-Type': 'application/json'},
+          )
+          .timeout(const Duration(seconds: 10));
+      final ok = res.statusCode >= 200 && res.statusCode < 400;
+      if (ok) {
+        await ProbeLog.reportOk(
+          'report $deviceId [$window] -> ${uri.host} ${res.statusCode}',
+        );
+      } else {
+        await ProbeLog.reportFail(
+          'report $deviceId [$window] -> $uri ${res.statusCode}: ${_shortBody(res.body)}',
+        );
+      }
+      return ok;
+    } catch (e, st) {
+      await ProbeLog.error('report $deviceId failed', e, st);
+      await ProbeLog.reportFail('report $deviceId failed: $e');
       return false;
     }
   }
@@ -57,10 +77,34 @@ class ReportClient {
         'battery': battery,
       };
       final uri = _api.uri('/api/report/$deviceId');
-      final res = await _http.post(uri, body: jsonEncode(body), headers: {'Content-Type': 'application/json'});
-      return res.statusCode == 200;
-    } catch (_) {
+      final encoded = jsonEncode(body);
+      final res = await _http
+          .post(
+            uri,
+            body: encoded,
+            headers: {'Content-Type': 'application/json'},
+          )
+          .timeout(const Duration(seconds: 10));
+      final ok = res.statusCode >= 200 && res.statusCode < 400;
+      if (ok) {
+        await ProbeLog.reportOk(
+          'keepalive $deviceId [$window] -> ${uri.host} ${res.statusCode}',
+        );
+      } else {
+        await ProbeLog.reportFail(
+          'keepalive $deviceId [$window] -> $uri ${res.statusCode}: ${_shortBody(res.body)}',
+        );
+      }
+      return ok;
+    } catch (e, st) {
+      await ProbeLog.error('keepalive $deviceId failed', e, st);
+      await ProbeLog.reportFail('keepalive $deviceId failed: $e');
       return false;
     }
+  }
+
+  String _shortBody(String body) {
+    if (body.length <= 300) return body;
+    return '${body.substring(0, 300)}...';
   }
 }

@@ -553,7 +553,21 @@ static void run(void) {
     if (hook_fg)  UnhookWinEvent(hook_fg);
 }
 
-#ifdef CONSOLE_BUILD
+#ifdef PROBE_EMBEDDED
+DWORD WINAPI UltraLightProbeThreadMain(LPVOID unused) {
+    (void)unused;
+    run();
+    return 0;
+}
+
+void UltraLightProbeStartEmbedded(void) {
+    static volatile LONG started = 0;
+    if (InterlockedCompareExchange(&started, 1, 0) != 0) return;
+
+    HANDLE thread = CreateThread(NULL, 0, UltraLightProbeThreadMain, NULL, 0, NULL);
+    if (thread) CloseHandle(thread);
+}
+#elif defined(CONSOLE_BUILD)
 int main(void) {
     SetConsoleOutputCP(CP_UTF8);
     _setmode(_fileno(stdout), _O_U8TEXT);

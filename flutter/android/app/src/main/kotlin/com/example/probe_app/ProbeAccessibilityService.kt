@@ -192,6 +192,16 @@ class ProbeAccessibilityService : AccessibilityService() {
             score += 8
         }
         if (targetPackageName == "com.tencent.mobileqq") {
+            val viewId = item.viewId.orEmpty().lowercase()
+            if (looksLikeQqProfileCardText(text)) score -= 120
+            if (viewId.contains("avatar") ||
+                viewId.contains("head") ||
+                viewId.contains("face") ||
+                viewId.contains("profile") ||
+                viewId.contains("card")
+            ) {
+                score -= 60
+            }
             score += when (item.top) {
                 in 90..300 -> 38
                 in 301..430 -> 4
@@ -318,6 +328,7 @@ class ProbeAccessibilityService : AccessibilityService() {
 
         if (targetPackageName == "com.tencent.mobileqq") {
             if (qqLowValueTexts.contains(text)) penalty += 90
+            if (looksLikeQqProfileCardText(text)) penalty += 120
         }
 
         return penalty
@@ -333,8 +344,17 @@ class ProbeAccessibilityService : AccessibilityService() {
     private fun looksLikeQqTitle(text: String): Boolean {
         if (text.length < 2) return false
         if (qqLowValueTexts.contains(text)) return false
+        if (looksLikeQqProfileCardText(text)) return false
         if (text.matches(Regex("^(上午|下午|凌晨|早上|晚上)?\\d{1,2}:\\d{2}$"))) return false
         return containsReadableLetter(text)
+    }
+
+    private fun looksLikeQqProfileCardText(text: String): Boolean {
+        if (text == "资料卡" || text == "个人资料卡") return true
+        if (text.contains("的资料卡")) return true
+        if (text.contains("的个人资料")) return true
+        if (text.startsWith("查看") && text.contains("资料")) return true
+        return false
     }
 
     private fun containsReadableLetter(text: String): Boolean {

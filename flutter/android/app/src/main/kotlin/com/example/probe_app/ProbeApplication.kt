@@ -8,6 +8,7 @@ import io.flutter.app.FlutterApplication
 class ProbeApplication : FlutterApplication() {
     override fun onCreate() {
         super.onCreate()
+        ProbeDeviceState.start(this)
         createServiceNotificationChannels()
     }
 

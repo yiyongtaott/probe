@@ -13,8 +13,14 @@ class ProbeAccessibilityService : AccessibilityService() {
     private var lastLoggedDisplay: String? = null
     private val lastMeaningfulTitles = mutableMapOf<String, String>()
 
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        ProbeDeviceState.start(this)
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+        ProbeDeviceState.writeCurrent(this, "accessibility")
         val eventType = event.eventType
         if (eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED &&

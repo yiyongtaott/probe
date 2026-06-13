@@ -6,6 +6,7 @@ import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -14,6 +15,9 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "hasAccessibilityAccess" -> result.success(hasAccessibilityAccess())
+                    "getAndroidDeviceState" -> {
+                        result.success(jsonToMap(ProbeDeviceState.writeCurrent(this, "method")))
+                    }
                     "openAccessibilitySettings" -> {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                         result.success(true)
@@ -35,5 +39,16 @@ class MainActivity : FlutterActivity() {
             it.equals(serviceName, ignoreCase = true) ||
                 it.equals(shortServiceName, ignoreCase = true)
         }
+    }
+
+    private fun jsonToMap(json: JSONObject): Map<String, Any?> {
+        val map = mutableMapOf<String, Any?>()
+        val keys = json.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val value = json.opt(key)
+            map[key] = if (value == JSONObject.NULL) null else value
+        }
+        return map
     }
 }

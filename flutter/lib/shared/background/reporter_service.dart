@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../api/report_client.dart';
 import '../api/api_client.dart';
@@ -24,6 +25,11 @@ class ReporterService {
   String _lastApp = '';
   int _sessionStartMs = 0;
   int _lastKeepaliveMs = 0;
+  bool _wakeRunning = false;
+  bool _wakePending = false;
+  String _pendingReason = 'wake';
+  _ReportVitals? _cachedVitals;
+  int _cachedVitalsAtMs = 0;
 
   /// 缓存刷新间隔（C Probe: SLOW_REFRESH_MS = 5min）
   static const int cacheRefreshMs = 5 * 60 * 1000;
@@ -34,27 +40,47 @@ class ReporterService {
     _report = ReportClient(_api);
   }
 
-  /// ── WorkManager / BGTaskScheduler 回调入口 ─────────────────────
-  Future<void> onWake() async {
+  /// ── 唤醒入口：文件事件、前台 Service、兜底定时器共用 ────────────────
+  Future<void> onWake({String reason = 'wake'}) async {
+    if (_wakeRunning) {
+      _wakePending = true;
+      _pendingReason = reason;
+      return;
+    }
+
+    _wakeRunning = true;
+    var currentReason = reason;
     try {
-      await ProbeLog.info('wake device=$deviceId server=$serverBase');
+      while (true) {
+        _wakePending = false;
+        await _runWake(currentReason);
+        if (!_wakePending) break;
+        currentReason = _pendingReason;
+      }
+    } finally {
+      _wakeRunning = false;
+    }
+  }
+
+  Future<void> _runWake(String reason) async {
+    try {
+      await ProbeLog.info('wake reason=$reason device=$deviceId');
       // 确保离线缓存已初始化
       await OfflineCache.ensureInitialized();
-      // 每次唤醒优先重试队列中的离线数据
-      await OfflineCache.autoFlush(_report, deviceId);
     } catch (e, st) {
       await ProbeLog.error('wake preparation failed', e, st);
     }
 
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final currentApp = await DeviceInfo.getForegroundApp();
+    final canKeepalive = await DeviceInfo.canSendKeepaliveFor(currentApp);
 
     if (_lastApp.isEmpty || _sessionStartMs == 0) {
       _lastApp = currentApp;
       _sessionStartMs = nowMs;
       _lastKeepaliveMs = nowMs;
       await ProbeLog.info('session start: $currentApp');
-      await _sendKeepalive(currentApp);
+      if (canKeepalive) await _sendKeepalive(currentApp);
       return;
     }
 
@@ -65,7 +91,10 @@ class ReporterService {
         _sessionStartMs = nowMs;
         return;
       }
-      await _maybeKeepalive(nowMs, currentApp);
+      await _maybeKeepalive(nowMs, currentApp, canKeepalive);
+      if (!reason.startsWith('event:')) {
+        await OfflineCache.autoFlush(_report, deviceId);
+      }
       return;
     }
 
@@ -77,39 +106,81 @@ class ReporterService {
     _sessionStartMs = nowMs;
     _lastKeepaliveMs = nowMs;
     await ProbeLog.info('session switch: $currentApp');
-    await _sendKeepalive(currentApp);
+    if (canKeepalive) await _sendKeepalive(currentApp);
   }
 
   /// ── 前台 Service 连续循环 ─────────────────────────────────────
-  /// 每 120s 检查一次（与 C Probe TIMER_TICK_MS = 120s 对齐）
-  Future<void> startContinuousLoop() async {
-    while (true) {
+  /// Android 使用 Accessibility/屏幕状态文件事件即时唤醒，120s 定时器仅兜底。
+  Future<void> startContinuousLoop({
+    Future<void> Function(String reason)? onAfterWake,
+  }) async {
+    StreamSubscription<String>? eventSubscription;
+    Timer? trailingEventTimer;
+    var lastEventWakeMs = 0;
+
+    Future<void> run(String reason) async {
       try {
-        await onWake();
+        await onWake(reason: reason);
+        await onAfterWake?.call(reason);
       } catch (e, st) {
         await ProbeLog.error('continuous loop failed', e, st);
       }
-      await Future.delayed(const Duration(seconds: 120));
+    }
+
+    void scheduleEventWake(String source) {
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final elapsedMs = nowMs - lastEventWakeMs;
+      if (elapsedMs >= 800) {
+        lastEventWakeMs = nowMs;
+        unawaited(run('event:$source'));
+        return;
+      }
+
+      trailingEventTimer?.cancel();
+      trailingEventTimer = Timer(Duration(milliseconds: 800 - elapsedMs), () {
+        lastEventWakeMs = DateTime.now().millisecondsSinceEpoch;
+        unawaited(run('event:$source'));
+      });
+    }
+
+    if (Platform.isAndroid) {
+      eventSubscription = DeviceInfo.watchAndroidForegroundChanges().listen(
+        scheduleEventWake,
+        onError: (Object e, StackTrace st) {
+          unawaited(ProbeLog.error('foreground watcher failed', e, st));
+        },
+      );
+    }
+
+    try {
+      await run('start');
+      while (true) {
+        await Future<void>.delayed(const Duration(seconds: 120));
+        await run('timer');
+      }
+    } finally {
+      trailingEventTimer?.cancel();
+      await eventSubscription?.cancel();
     }
   }
 
   /// 240s keepalive 节流（与 C Probe KEEPALIVE_MS 对齐）
-  Future<void> _maybeKeepalive(int nowMs, String app) async {
+  Future<void> _maybeKeepalive(int nowMs, String app, bool canKeepalive) async {
     if (nowMs - _lastKeepaliveMs < 240000) return;
+    if (!canKeepalive) return;
     _lastKeepaliveMs = nowMs;
     await _sendKeepalive(app);
   }
 
   Future<void> _sendReport(String app, int start, int end) async {
-    final (wifi, ip) = await DeviceInfo.getNetworkInfo();
-    final battery = await DeviceInfo.getBattery();
+    final vitals = await _getVitals();
 
     final ok = await _report.sendReport(
       deviceId: deviceId,
       window: app,
-      lan: ip,
-      wifi: wifi,
-      battery: battery,
+      lan: vitals.ip,
+      wifi: vitals.wifi,
+      battery: vitals.battery,
       start: start,
       end: end,
       dur: end - start,
@@ -119,9 +190,9 @@ class ReporterService {
       await OfflineCache.enqueue(
         ReportPayload(
           window: app,
-          lan: ip,
-          wifi: wifi,
-          battery: battery,
+          lan: vitals.ip,
+          wifi: vitals.wifi,
+          battery: vitals.battery,
           start: start,
           end: end,
           dur: end - start,
@@ -131,14 +202,13 @@ class ReporterService {
   }
 
   Future<void> _sendKeepalive(String app) async {
-    final (wifi, ip) = await DeviceInfo.getNetworkInfo();
-    final battery = await DeviceInfo.getBattery();
+    final vitals = await _getVitals();
     final ok = await _report.sendKeepalive(
       deviceId: deviceId,
       window: app,
-      lan: ip,
-      wifi: wifi,
-      battery: battery,
+      lan: vitals.ip,
+      wifi: vitals.wifi,
+      battery: vitals.battery,
     );
     if (!ok) {
       await ProbeLog.reportFail('keepalive failed for $deviceId');
@@ -146,6 +216,33 @@ class ReporterService {
       await OfflineCache.autoFlush(_report, deviceId);
     }
   }
+
+  Future<_ReportVitals> _getVitals() async {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final cached = _cachedVitals;
+    if (cached != null && nowMs - _cachedVitalsAtMs < cacheRefreshMs) {
+      return cached;
+    }
+
+    final (wifi, ip) = await DeviceInfo.getNetworkInfo();
+    final battery = await DeviceInfo.getBattery();
+    final vitals = _ReportVitals(wifi: wifi, ip: ip, battery: battery);
+    _cachedVitals = vitals;
+    _cachedVitalsAtMs = nowMs;
+    return vitals;
+  }
+}
+
+class _ReportVitals {
+  final String wifi;
+  final String ip;
+  final String battery;
+
+  const _ReportVitals({
+    required this.wifi,
+    required this.ip,
+    required this.battery,
+  });
 }
 
 /// 离线缓存（与 C Probe pending ring buffer 功能一致）

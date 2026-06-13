@@ -13,11 +13,11 @@ String activeServerBase = ServerSelector.primary;
 @pragma('vm:entry-point')
 void callbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
-    final reporter = ReporterService(
-      deviceId: DeviceInfo.detectDeviceIdSync(),
-      serverBase: activeServerBase,
-    );
-    await reporter.onWake();
+    WidgetsFlutterBinding.ensureInitialized();
+    final service = FlutterBackgroundService();
+    if (!await service.isRunning()) {
+      await service.startService();
+    }
     return true;
   });
 }
@@ -30,9 +30,7 @@ void onStart(ServiceInstance service) {
     serverBase: activeServerBase,
   );
 
-  Timer.periodic(const Duration(seconds: 60), (_) async {
-    await reporter.onWake();
-  });
+  unawaited(reporter.startContinuousLoop());
 
   service.on('stopService').listen((event) {
     service.stopSelf();
@@ -52,10 +50,7 @@ Future<void> initializeForegroundService() async {
       initialNotificationContent: '正在上报活动状态',
       foregroundServiceNotificationId: 888,
     ),
-    iosConfiguration: IosConfiguration(
-      autoStart: true,
-      onForeground: onStart,
-    ),
+    iosConfiguration: IosConfiguration(autoStart: true, onForeground: onStart),
   );
   await service.startService();
 }

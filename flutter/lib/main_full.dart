@@ -39,18 +39,11 @@ void _androidWorkmanagerDispatcher() {
     DartPluginRegistrant.ensureInitialized();
 
     try {
-      final deviceId =
-          inputData?['deviceId'] as String? ?? DeviceInfo.detectDeviceIdSync();
-      final serverBase =
-          inputData?['serverBase'] as String? ??
-          await ServerSelector().probeAndFailover();
-      await ProbeLog.info('workmanager task=$task device=$deviceId');
-
-      final reporter = ReporterService(
-        deviceId: deviceId,
-        serverBase: serverBase,
-      );
-      await reporter.onWake();
+      final service = FlutterBackgroundService();
+      if (!await service.isRunning()) {
+        await service.startService();
+      }
+      await ProbeLog.info('workmanager fallback task=$task ensured service');
       return true;
     } catch (e, st) {
       await ProbeLog.error('workmanager failed', e, st);
@@ -68,16 +61,20 @@ Future<void> _androidServiceOnStart(ServiceInstance service) async {
   final serverBase = await ServerSelector().probeAndFailover();
   final reporter = ReporterService(deviceId: deviceId, serverBase: serverBase);
 
+  Future<void> updateNotification(String reason) async {
+    if (service is AndroidServiceInstance) {
+      await service.setForegroundNotificationInfo(
+        title: 'UltraLightProbe',
+        content: '最近上报: ${DateTime.now().toLocal()} ($reason)',
+      );
+    }
+  }
+
   Future<void> runOnce(String reason) async {
     try {
       await ProbeLog.info('service wake reason=$reason device=$deviceId');
-      await reporter.onWake();
-      if (service is AndroidServiceInstance) {
-        await service.setForegroundNotificationInfo(
-          title: 'UltraLightProbe',
-          content: '最近上报: ${DateTime.now().toLocal()}',
-        );
-      }
+      await reporter.onWake(reason: reason);
+      await updateNotification(reason);
     } catch (e, st) {
       await ProbeLog.error('service wake failed', e, st);
     }
@@ -98,10 +95,7 @@ Future<void> _androidServiceOnStart(ServiceInstance service) async {
     unawaited(runOnce('manual'));
   });
 
-  await runOnce('start');
-  Timer.periodic(const Duration(seconds: 120), (_) {
-    unawaited(runOnce('timer'));
-  });
+  await reporter.startContinuousLoop(onAfterWake: updateNotification);
 }
 
 void main() async {
@@ -169,18 +163,16 @@ Future<void> _initializeAndroidReporter(
     await Workmanager().initialize(_androidWorkmanagerDispatcher);
     await Workmanager().registerOneOffTask(
       'probe_android_startup_report',
-      'probeReport',
+      'probeServiceFallback',
       existingWorkPolicy: ExistingWorkPolicy.replace,
       initialDelay: const Duration(seconds: 8),
-      constraints: Constraints(networkType: NetworkType.connected),
       inputData: inputData,
     );
     await Workmanager().registerPeriodicTask(
       'probe_android_periodic_report',
-      'probeReport',
+      'probeServiceFallback',
       frequency: const Duration(minutes: 15),
       existingWorkPolicy: ExistingWorkPolicy.replace,
-      constraints: Constraints(networkType: NetworkType.connected),
       inputData: inputData,
     );
   } catch (e, st) {

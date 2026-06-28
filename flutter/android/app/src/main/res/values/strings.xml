@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="probe_accessibility_description">Read the current visible window title for UltraLightProbe reporting.</string>
+</resources>

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="tulpa_accessibility_description">采集当前浏览窗口的页面标题和 App 来源，用于生成对话话题。不保存正文、图片或输入内容。</string>
+</resources>

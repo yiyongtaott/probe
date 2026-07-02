@@ -250,6 +250,136 @@ async function ensureAuthSchema(env) {
     _authInit = true;
 }
 
+// ─── 访客统计表懒建（与核心表一起初始化）───
+let _visitorInit = false;
+async function ensureVisitorSchema(env) {
+    if (_visitorInit) return;
+    try {
+        await env.DB.prepare(
+            `CREATE TABLE IF NOT EXISTS visitor_stats (
+                visitor_hash   TEXT PRIMARY KEY,
+                first_seen     INTEGER NOT NULL,
+                last_seen      INTEGER NOT NULL,
+                visit_count    INTEGER NOT NULL DEFAULT 1,
+                last_ip        TEXT,
+                user_agent     TEXT,
+                user_name      TEXT,
+                last_visit_day TEXT
+            )`
+        ).run();
+        await env.DB.prepare(
+            `CREATE TABLE IF NOT EXISTS visitor_daily (
+                day             TEXT PRIMARY KEY,
+                unique_visitors INTEGER NOT NULL DEFAULT 0,
+                total_visits    INTEGER NOT NULL DEFAULT 0
+            )`
+        ).run();
+        await env.DB.prepare(
+            `CREATE INDEX IF NOT EXISTS idx_visitor_stats_last_seen ON visitor_stats(last_seen DESC)`
+        ).run();
+        await env.DB.prepare(
+            `CREATE INDEX IF NOT EXISTS idx_visitor_daily_day ON visitor_daily(day DESC)`
+        ).run();
+    } catch (e) { /* 并发时忽略 */ }
+    _visitorInit = true;
+}
+
+// 记录访客：按 visitor_hash(IP+指纹) 去重，同一天内同一访客只算一次独立访问
+// 但每次心跳都会更新 last_seen 和 visit_count（总访问次数）
+async function recordVisitor(env, visitorHash, cfIp, userAgent, userName) {
+    const now = Date.now();
+    const today = shanghaiDay(now);
+
+    const existing = await env.DB.prepare(
+        `SELECT visitor_hash, last_visit_day FROM visitor_stats WHERE visitor_hash = ?`
+    ).bind(visitorHash).first();
+
+    if (!existing) {
+        // 新访客：插入 visitor_stats + 当日 unique_visitors +1
+        await env.DB.prepare(
+            `INSERT INTO visitor_stats (visitor_hash, first_seen, last_seen, visit_count, last_ip, user_agent, user_name, last_visit_day)
+             VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+             ON CONFLICT(visitor_hash) DO UPDATE SET last_seen = excluded.last_seen, visit_count = visit_count + 1,
+                 last_ip = excluded.last_ip, user_name = excluded.user_name, last_visit_day = excluded.last_visit_day`
+        ).bind(visitorHash, now, now, cfIp, userAgent, userName || null, today).run();
+        await env.DB.prepare(
+            `INSERT INTO visitor_daily (day, unique_visitors, total_visits) VALUES (?, 1, 1)
+             ON CONFLICT(day) DO UPDATE SET total_visits = total_visits + 1`
+        ).bind(today).run();
+    } else if (existing.last_visit_day !== today) {
+        // 跨天回访：visit_count+1, 更新 last_seen, 新的一天 unique_visitors+1
+        await env.DB.prepare(
+            `UPDATE visitor_stats SET last_seen = ?, visit_count = visit_count + 1,
+                 last_ip = ?, user_name = ?, last_visit_day = ?
+             WHERE visitor_hash = ?`
+        ).bind(now, cfIp, userName || null, today, visitorHash).run();
+        await env.DB.prepare(
+            `INSERT INTO visitor_daily (day, unique_visitors, total_visits) VALUES (?, 1, 1)
+             ON CONFLICT(day) DO UPDATE SET unique_visitors = unique_visitors + 1, total_visits = total_visits + 1`
+        ).bind(today).run();
+    } else {
+        // 同一天内重复访问：visit_count+1（总次数）, 更新 last_seen, 但当天 unique_visitors 不变
+        await env.DB.prepare(
+            `UPDATE visitor_stats SET last_seen = ?, visit_count = visit_count + 1,
+                 last_ip = ?, user_name = ?
+             WHERE visitor_hash = ?`
+        ).bind(now, cfIp, userName || null, visitorHash).run();
+        await env.DB.prepare(
+            `INSERT INTO visitor_daily (day, unique_visitors, total_visits) VALUES (?, 0, 1)
+             ON CONFLICT(day) DO UPDATE SET total_visits = total_visits + 1`
+        ).bind(today).run();
+    }
+}
+
+// 查询访客统计数据
+async function handleVisitorStats(request, env, url) {
+    try {
+        await ensureVisitorSchema(env);
+        const today = shanghaiDay();
+
+        // 总独立访客数 + 总访问次数
+        const totalRow = await env.DB.prepare(
+            `SELECT COUNT(*) AS total_visitors, COALESCE(SUM(visit_count), 0) AS total_visits FROM visitor_stats`
+        ).first();
+
+        // 今日独立访客数 + 今日总访问次数
+        const todayRow = await env.DB.prepare(
+            `SELECT unique_visitors, total_visits FROM visitor_daily WHERE day = ?`
+        ).bind(today).first();
+
+        // 最近 7 天每日统计（用于趋势图）
+        const dailyRows = await env.DB.prepare(
+            `SELECT day, unique_visitors, total_visits FROM visitor_daily ORDER BY day DESC LIMIT 7`
+        ).all();
+        const dailyHistory = (dailyRows.results || []).reverse();
+
+        // 最近活跃访客（最近 24 小时内）
+        const recentRows = await env.DB.prepare(
+            `SELECT visitor_hash, first_seen, last_seen, visit_count, last_ip, user_name
+             FROM visitor_stats WHERE last_seen > ? ORDER BY last_seen DESC LIMIT 20`
+        ).bind(Date.now() - 86400000).all();
+        const recentVisitors = (recentRows.results || []).map(v => ({
+            hash: v.visitor_hash.slice(0, 8),
+            firstSeen: v.first_seen,
+            lastSeen: v.last_seen,
+            visitCount: v.visit_count,
+            ip: v.last_ip || 'unknown',
+            userName: v.user_name,
+        }));
+
+        return createResponse(JSON.stringify({
+            totalVisitors: (totalRow && totalRow.total_visitors) || 0,
+            totalVisits: (totalRow && totalRow.total_visits) || 0,
+            todayVisitors: (todayRow && todayRow.unique_visitors) || 0,
+            todayVisits: (todayRow && todayRow.total_visits) || 0,
+            dailyHistory,
+            recentVisitors,
+        }));
+    } catch (err) {
+        return createResponse(JSON.stringify({ error: err.message }), 500);
+    }
+}
+
 function profileFromRow(row) {
     return {
         provider: row.provider || "google",
@@ -412,6 +542,18 @@ async function runCleanup(env) {
         ).run();
     } catch (e) {
         // 字典表/列可能尚未就绪（migration 未应用），忽略
+    }
+
+    // 访客统计 GC：删除超过 365 天未访问的访客记录 + 超过 365 天的每日统计行
+    try {
+        await env.DB.prepare(
+            `DELETE FROM visitor_stats WHERE last_seen < ?`
+        ).bind(now - 365 * DAY).run();
+        await env.DB.prepare(
+            `DELETE FROM visitor_daily WHERE day < ?`
+        ).bind(shanghaiDay(now - 365 * DAY)).run();
+    } catch (e) {
+        // 访客表可能尚未就绪（migration 未应用），忽略
     }
 }
 
@@ -771,12 +913,13 @@ async function handleChat(request, env, url) {
     }
 }
 
-// [API] 用户心跳（需求3：保存 IP，返回含 IP 的在线列表）
+// [API] 用户心跳（需求3：保存 IP，返回含 IP 的在线列表 + 访客统计）
 async function handleHeartbeat(request, env, url) {
     try {
-        const { sessionId, userName } = await request.json();
+        const { sessionId, userName, fingerprint } = await request.json();
         const now   = Date.now();
         const cfIp  = request.headers.get("CF-Connecting-IP") || "unknown";
+        const ua    = request.headers.get("User-Agent") || "";
 
         await env.DB.prepare(
             `INSERT INTO online_users (session_id, user_name, last_seen, ip)
@@ -784,6 +927,13 @@ async function handleHeartbeat(request, env, url) {
              ON CONFLICT(session_id) DO UPDATE SET
              last_seen=excluded.last_seen, user_name=excluded.user_name, ip=excluded.ip`
         ).bind(sessionId, userName || "匿名", now, cfIp).run();
+
+        // 访客统计：IP + 浏览器指纹组合哈希做去重
+        if (fingerprint) {
+            await ensureVisitorSchema(env);
+            const visitorHash = await sha256Hex(cfIp + '|' + fingerprint);
+            await recordVisitor(env, visitorHash, cfIp, ua.slice(0, 500), userName || null);
+        }
 
         const onlineRows = await env.DB.prepare(
             "SELECT session_id, user_name, last_seen, ip FROM online_users WHERE last_seen > ?"
@@ -1003,6 +1153,7 @@ const ROUTES = {
     "GET /api/history":         handleHistory,
     "POST /api/chat":           handleChat,
     "POST /api/heartbeat":      handleHeartbeat,
+    "GET /api/visitor-stats":   handleVisitorStats,
     "POST /api/ai-summary":     handleAiSummary,
     "GET /api/ai-data":         handleAiData,
     "GET /api/ai-usage":        handleAiUsage,

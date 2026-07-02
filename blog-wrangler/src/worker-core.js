@@ -1024,6 +1024,33 @@ export default {
             return new Response(null, { headers: corsHeaders });
         }
 
+        // SEO 静态文件：在 Assets 回落前拦截，确保返回正确的 Content-Type。
+        // 否则 wrangler 的 not_found_handling:"single-page-application" 会把
+        // robots.txt / sitemap.xml 回落为 index.html（text/html），被搜索引擎拒收。
+        if (method === "GET" && pathname === "/robots.txt") {
+            return new Response(
+                "User-agent: *\nAllow: /\n\nSitemap: https://flandretiamat.dpdns.org/sitemap.xml\n",
+                { status: 200, headers: { "Content-Type": "text/plain; charset=UTF-8", "Cache-Control": "public, max-age=86400" } }
+            );
+        }
+        if (method === "GET" && pathname === "/sitemap.xml") {
+            const today = new Date().toISOString().slice(0, 10);
+            const xml =
+                '<?xml version="1.0" encoding="UTF-8"?>\n' +
+                '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' +
+                '  <url>\n' +
+                '    <loc>https://flandretiamat.dpdns.org/</loc>\n' +
+                '    <lastmod>' + today + '</lastmod>\n' +
+                '    <changefreq>daily</changefreq>\n' +
+                '    <priority>1.0</priority>\n' +
+                '  </url>\n' +
+                '</urlset>\n';
+            return new Response(xml, {
+                status: 200,
+                headers: { "Content-Type": "application/xml; charset=UTF-8", "Cache-Control": "public, max-age=86400" }
+            });
+        }
+
         // 仅 API 路由需要 D1；静态资源请求直接走 Assets，不必初始化表
         if (pathname.startsWith("/api/")) {
             await ensureCoreTables(env);

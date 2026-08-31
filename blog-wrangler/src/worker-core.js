@@ -354,17 +354,27 @@ async function handleVisitorStats(request, env, url) {
         const dailyHistory = (dailyRows.results || []).reverse();
 
         // 最近活跃访客（最近 24 小时内）
+        // 按 IP + 用户名聚合：同一个用户多次刷新只算一条，解决「明明同一人却重复显示」的视觉问题
         const recentRows = await env.DB.prepare(
-            `SELECT visitor_hash, first_seen, last_seen, visit_count, last_ip, user_name
-             FROM visitor_stats WHERE last_seen > ? ORDER BY last_seen DESC LIMIT 20`
+            `SELECT last_ip,
+                    COALESCE(NULLIF(user_name, ''), '访客') AS user_name,
+                    COUNT(*) AS sessions,
+                    SUM(visit_count) AS totalVisits,
+                    MAX(last_seen) AS last_seen,
+                    MAX(first_seen) AS first_seen
+             FROM visitor_stats
+             WHERE last_seen > ?
+             GROUP BY last_ip, COALESCE(NULLIF(user_name, ''), '访客')
+             ORDER BY last_seen DESC
+             LIMIT 20`
         ).bind(Date.now() - 86400000).all();
         const recentVisitors = (recentRows.results || []).map(v => ({
-            hash: v.visitor_hash.slice(0, 8),
+            hash: (v.last_ip || 'unknown').replace(/\./g, '') + '_' + (v.user_name || '访客'),
             firstSeen: v.first_seen,
             lastSeen: v.last_seen,
-            visitCount: v.visit_count,
+            visitCount: v.totalVisits || v.sessions || 1,
             ip: v.last_ip || 'unknown',
-            userName: v.user_name,
+            userName: v.user_name || '访客',
         }));
 
         return createResponse(JSON.stringify({
@@ -449,6 +459,7 @@ function parseProbePayload(raw) {
         const obj = JSON.parse(raw);
         return {
             window:    normalizeWindowTitle(obj.window || raw),
+            bg_app:    normalizeWindowTitle(obj.bg_app || ''),
             lan:       obj.lan     || 'unknown',
             wifi:      obj.wifi    || 'unknown',
             battery:   obj.battery || 'unknown',
@@ -460,6 +471,7 @@ function parseProbePayload(raw) {
     } catch {
         return {
             window: normalizeWindowTitle(raw),
+            bg_app: '',
             lan: 'unknown',
             wifi: 'unknown',
             battery: 'unknown',
@@ -811,7 +823,13 @@ async function handleReport(request, env, url) {
 
         const parsed  = parseProbePayload(rawBody);
         // 系统状态窗口（息屏/锁屏）现可作为设备状态显示；噪声标题仍置 null
-        const statusTitle = isNoiseWindowTitle(parsed.window) ? null : parsed.window;
+        let statusTitle = isNoiseWindowTitle(parsed.window) ? null : parsed.window;
+        // QQ/TIM 后台可见窗口：把 bg_app 附加到设备状态显示
+        const bgApp = parsed.bg_app || '';
+        if (bgApp && !isNoiseWindowTitle(bgApp)) {
+            const fgLabel = statusTitle || '系统在线';
+            statusTitle = fgLabel + ' \u2502 QQ: ' + bgApp;
+        }
 
         // 实时设备行：每次上报（含 keepalive）都刷新，保证在线状态与当前活动新鲜
         await env.DB.prepare(

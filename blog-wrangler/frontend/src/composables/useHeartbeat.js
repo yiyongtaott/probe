@@ -35,12 +35,21 @@ if (!localStorage.getItem('fl_session_id')) {
 
 export function useHeartbeat() {
   const onlineUserList = computed(() => {
-    return Object.entries(chatState.onlineUsers.value).map(([sid, u]) => ({
+    // 同一个浏览器/同一个人刷新、或刷新/无痕窗口切换时，可能产生多条 online_users 记录。
+    // 按 IP + 昵称去重，保留最近活跃的一条，避免「同一人多条」。
+    const list = Object.entries(chatState.onlineUsers.value).map(([sid, u]) => ({
       sessionId: sid,
       userName: u.userName,
       ip: u.ip || 'unknown',
       lastSeen: u.lastSeen,
-    })).sort((a, b) => b.lastSeen - a.lastSeen)
+    }))
+    const byKey = new Map()
+    for (const row of list) {
+      const key = `${row.ip}|${row.userName}`
+      const prev = byKey.get(key)
+      if (!prev || (row.lastSeen || 0) > (prev.lastSeen || 0)) byKey.set(key, row)
+    }
+    return Array.from(byKey.values()).sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))
   })
 
   function saveUserName() {

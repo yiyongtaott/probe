@@ -522,19 +522,91 @@ static void report_session(const wchar_t *title, ULONGLONG start, ULONGLONG end)
     }
 }
 
+/* ── QQ/TIM background window detection ────────────────────────────────── */
+static wchar_t g_bg_app_title[TITLE_CAP] = L"";   /* non-foreground QQ/TIM title (for keepalive) */
+
+/* Check if a process name belongs to QQ/TIM family. */
+static BOOL is_qq_process(const wchar_t *procLower) {
+    static const wchar_t * const qqProcs[] = {
+        L"qq", L"qqnt", L"qqprotect", L"tim", L"qqplayer",
+        L"qqmusic", L"qqbrowser", L"qqmain",
+    };
+    for (int i = 0; i < (int)(sizeof(qqProcs)/sizeof(qqProcs[0])); i++) {
+        /* exact match or ends with .exe suffix */
+        if (wcsstr(procLower, qqProcs[i])) return TRUE;
+    }
+    return FALSE;
+}
+
+struct qq_enum_ctx { wchar_t title[TITLE_CAP]; BOOL found; };
+
+static BOOL CALLBACK enum_visible_qq(HWND hwnd, LPARAM lParam) {
+    struct qq_enum_ctx *ctx = (struct qq_enum_ctx *)lParam;
+    if (ctx->found) return TRUE;   /* already found one */
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    if (hwnd == GetForegroundWindow()) return TRUE;   /* skip foreground (handled elsewhere) */
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    wchar_t name[MAX_PATH];
+    if (!get_process_name(pid, name, MAX_PATH)) return TRUE;
+
+    wchar_t lp[MAX_PATH];
+    to_lower_w(name, lp, MAX_PATH);
+    if (!is_qq_process(lp)) return TRUE;
+
+    /* Found a visible QQ/TIM window that is NOT the foreground. */
+    wchar_t buf[512];
+    int len = GetWindowTextW(hwnd, buf, 512);
+    if (len <= 0) return TRUE;
+    int s = 0, e = len - 1;
+    while (s <= e && iswspace(buf[s])) s++;
+    while (e >= s && iswspace(buf[e])) e--;
+    if (e < s) return TRUE;
+    buf[e + 1] = L'\0';
+    wchar_t clean[TITLE_CAP];
+    normalize_report_title(buf + s, clean, TITLE_CAP);
+    if (clean[0] && is_reportable_title(clean, 0)) {
+        copy_w(ctx->title, TITLE_CAP, clean);
+        ctx->found = TRUE;
+    }
+    return TRUE;
+}
+
+/* Scan for visible QQ/TIM windows that are not foreground. */
+static void scan_bg_qq(void) {
+    struct qq_enum_ctx ctx;
+    ctx.title[0] = L'\0';
+    ctx.found = FALSE;
+    EnumWindows(enum_visible_qq, (LPARAM)&ctx);
+    if (ctx.found)
+        copy_w(g_bg_app_title, TITLE_CAP, ctx.title);
+    else
+        g_bg_app_title[0] = L'\0';
+}
+
 /* Liveness ping: refresh the live device row only (no history row). Sent only
-   while the user is active, so an idle/locked machine still reads offline. */
+   while the user is active, so an idle/locked machine still reads offline.
+   If a QQ/TIM window is visible (but not foreground), include it as bg_app
+   so the dashboard shows QQ activity on the notebook. */
 static void send_keepalive(void) {
-    wchar_t payload[PAYLOAD_CAP], et[TITLE_CAP], ew[256];
+    wchar_t payload[PAYLOAD_CAP], et[TITLE_CAP], ew[256], ebg[TITLE_CAP];
     char    body[BODY_CAP];
     wchar_t clean[TITLE_CAP];
     normalize_report_title(g_cur_title, clean, TITLE_CAP);
     if (!is_reportable_title(clean, 0)) return;
     json_escape_w(clean, et, TITLE_CAP);
     json_escape_w(g_wifi, ew, 256);
-    swprintf(payload, PAYLOAD_CAP,
-             L"{\"keepalive\":1,\"window\":\"%ls\",\"lan\":\"%ls\",\"wifi\":\"%ls\",\"battery\":\"%ls\"}",
-             et, g_lan, ew, g_battery);
+    if (g_bg_app_title[0]) {
+        json_escape_w(g_bg_app_title, ebg, TITLE_CAP);
+        swprintf(payload, PAYLOAD_CAP,
+                 L"{\"keepalive\":1,\"window\":\"%ls\",\"bg_app\":\"%ls\",\"lan\":\"%ls\",\"wifi\":\"%ls\",\"battery\":\"%ls\"}",
+                 et, ebg, g_lan, ew, g_battery);
+    } else {
+        swprintf(payload, PAYLOAD_CAP,
+                 L"{\"keepalive\":1,\"window\":\"%ls\",\"lan\":\"%ls\",\"wifi\":\"%ls\",\"battery\":\"%ls\"}",
+                 et, g_lan, ew, g_battery);
+    }
     int n = WideCharToMultiByte(CP_UTF8, 0, payload, -1, body, BODY_CAP, NULL, NULL);
     if (n <= 0) return;
     if (send_data(body, (DWORD)(n - 1))) { g_last_send = now_ms(); flush_pending(); }
@@ -606,6 +678,11 @@ static void CALLBACK win_event_namechange_proc(HWINEVENTHOOK hHook, DWORD event,
             return;
         }
     }
+    /* QQ/TIM family — title changes in non-foreground windows too */
+    if (is_qq_process(lp)) {
+        on_possible_change();
+        return;
+    }
 }
 
 /* 120s housekeeping: same-window title changes, slow cache, checkpoint, retry. */
@@ -614,6 +691,7 @@ static void CALLBACK timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     ULONGLONG now = now_ms();
     if (now - g_last_slow >= SLOW_REFRESH_MS) { refresh_slow_cache(); g_last_slow = now; }
     on_possible_change();                                        /* tab/title changes */
+    scan_bg_qq();                                                /* detect visible QQ/TIM windows */
     if (g_cur_start != 0 && now - g_cur_start >= CHECKPOINT_MS) checkpoint_session();
     /* Active user staying in one window: keep dashboard 'online' without a history
        row. Idle/locked => no input => no ping => correctly drops to offline. */

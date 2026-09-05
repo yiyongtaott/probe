@@ -1,10 +1,13 @@
 import { computed } from 'vue'
 import { chatState } from './useChat'
+import { BABY_DEVICE_ID } from '../utils/helpers'
+import { isLoggedIn } from './useAuth'
 
 const DEFAULT_NODES = [
   { id: 'desktop', type: 'desktop' },
   { id: 'notebook', type: 'notebook' },
   { id: 'phone', type: 'phone' },
+  { id: BABY_DEVICE_ID, type: 'baby' },
 ]
 
 export function useSync() {
@@ -13,8 +16,11 @@ export function useSync() {
     const nodes = []
     const rawData = chatState.rawData.value
     const defaultIds = DEFAULT_NODES.map(n => n.id)
+    const loggedIn = isLoggedIn()
 
     DEFAULT_NODES.forEach(def => {
+      // 私有设备（宝宝手机）仅登录后可见
+      if (def.id === BABY_DEVICE_ID && !loggedIn) return
       const deviceId = def.id
       const lastSeenTs = rawData.lastSeen[deviceId] || 0
       let statusText = rawData.devices[deviceId] || '系统离线'
@@ -35,6 +41,8 @@ export function useSync() {
 
     Object.keys(rawData.devices).forEach(deviceId => {
       if (defaultIds.includes(deviceId)) return
+      // 未登录时不展示私有设备（防 token 失效后残留旧同步数据）
+      if (deviceId === BABY_DEVICE_ID && !loggedIn) return
       const lastSeenTs = rawData.lastSeen[deviceId] || 0
       if ((now - lastSeenTs) < 259200000) {
         let statusText = rawData.devices[deviceId] || '系统在线'

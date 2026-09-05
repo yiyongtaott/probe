@@ -21,6 +21,7 @@ const { displayNodes } = useSync()
               node.type === 'desktop'  ? 'bg-blue-500/10 border border-blue-500/20' :
               node.type === 'notebook' ? 'bg-purple-500/10 border border-purple-500/20' :
               node.type === 'phone'    ? 'bg-cyan-500/10 border border-cyan-500/20' :
+              node.type === 'baby'     ? 'bg-pink-500/10 border border-pink-500/20' :
               'bg-green-500/10 border border-green-500/20']"
           >
             <!-- Desktop icon -->
@@ -46,6 +47,14 @@ const { displayNodes } = useSync()
               fill="none" stroke="currentColor" viewBox="0 0 24 24"
             >
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M10.5 1.5H8.25A2.25 2.25 0 006 3.75v16.5a2.25 2.25 0 002.25 2.25h7.5A2.25 2.25 0 0018 20.25V3.75a2.25 2.25 0 00-2.25-2.25H13.5m-3 0V3h3V1.5m-3 0h3m-3 18.75h3" />
+            </svg>
+            <!-- Baby phone icon (private/绑定设备) -->
+            <svg
+              v-else-if="node.type === 'baby'"
+              class="w-8 h-8 text-pink-400"
+              fill="none" stroke="currentColor" viewBox="0 0 24 24"
+            >
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12z" />
             </svg>
             <!-- Unknown icon -->
             <svg

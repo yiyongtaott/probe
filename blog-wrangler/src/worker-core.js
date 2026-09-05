@@ -104,6 +104,28 @@ const DEFAULT_ACCOUNT = {
     password: "13786022334Yyt",
 };
 
+// 默认公共设备（未登录也可见）
+const DEFAULT_PUBLIC_DEVICES = ["desktop", "notebook", "phone"];
+// 私有/绑定设备：仅登录后可查看（账号的“宝宝手机”），卡片固定展示为第 4 台设备
+const PRIVATE_DEVICE = { id: "宝宝手机", name: "宝宝手机" };
+const PRIVATE_DEVICE_ID = PRIVATE_DEVICE.id;
+
+// URL path 段里的设备 id 可能被 percent-encode（如中文 id），解码一次后小写归一
+function decodePathDeviceId(raw) {
+    const s = String(raw == null ? "" : raw).trim();
+    if (!s) return "";
+    try {
+        return decodeURIComponent(s).toLowerCase();
+    } catch (e) {
+        return s.toLowerCase();
+    }
+}
+
+// 是否属于“仅登录可见”的私有设备
+function isPrivateDeviceId(id) {
+    return id === PRIVATE_DEVICE_ID;
+}
+
 const LEADING_GLYPHS = new Set([
     0x231B, 0x23F3, 0x25CC, 0x25D0, 0x25D1, 0x25D2, 0x25D3, 0x25E6, 0x25EF,
     0x2605, 0x2606, 0x2611, 0x2612, 0x2615, 0x263A, 0x263B, 0x26A0, 0x26AA,
@@ -193,6 +215,9 @@ function isNoiseWindowTitle(value) {
     if (/^(?:\d+(?:\.\d+)?x|\d+(?:\.\d+)?倍|倍速)$/.test(compact)) return true;
     if (/(?:倍速中|正在加载|加载中|缓冲中)/.test(title) && title.length <= 20) return true;
     if (/^[\s._\-|/\\:;'"`~!?()[\]{}<>*+=#@$%^&]+$/.test(title)) return true;
+    // QQ/TIM main windows legitimately use short repeated titles such as "QQ".
+    // Keep them visible even though the generic low-information heuristic rejects repeats.
+    if (SHORT_MEANINGFUL_TITLES.has(compact)) return false;
     if (hasLowInformation(title)) return true;
     return false;
 }
@@ -258,6 +283,7 @@ async function ensureVisitorSchema(env) {
         await env.DB.prepare(
             `CREATE TABLE IF NOT EXISTS visitor_stats (
                 visitor_hash   TEXT PRIMARY KEY,
+                fingerprint    TEXT,
                 first_seen     INTEGER NOT NULL,
                 last_seen      INTEGER NOT NULL,
                 visit_count    INTEGER NOT NULL DEFAULT 1,
@@ -274,8 +300,16 @@ async function ensureVisitorSchema(env) {
                 total_visits    INTEGER NOT NULL DEFAULT 0
             )`
         ).run();
+        try {
+            await env.DB.prepare(`ALTER TABLE visitor_stats ADD COLUMN fingerprint TEXT`).run();
+        } catch (e) {
+            // Column already exists or migration has been applied.
+        }
         await env.DB.prepare(
             `CREATE INDEX IF NOT EXISTS idx_visitor_stats_last_seen ON visitor_stats(last_seen DESC)`
+        ).run();
+        await env.DB.prepare(
+            `CREATE INDEX IF NOT EXISTS idx_visitor_stats_fingerprint ON visitor_stats(fingerprint)`
         ).run();
         await env.DB.prepare(
             `CREATE INDEX IF NOT EXISTS idx_visitor_daily_day ON visitor_daily(day DESC)`
@@ -286,22 +320,22 @@ async function ensureVisitorSchema(env) {
 
 // 记录访客：按 visitor_hash(IP+指纹) 去重，同一天内同一访客只算一次独立访问
 // 但每次心跳都会更新 last_seen 和 visit_count（总访问次数）
-async function recordVisitor(env, visitorHash, cfIp, userAgent, userName) {
+async function recordVisitor(env, visitorHash, fingerprint, cfIp, userAgent, userName) {
     const now = Date.now();
     const today = shanghaiDay(now);
 
     const existing = await env.DB.prepare(
-        `SELECT visitor_hash, last_visit_day FROM visitor_stats WHERE visitor_hash = ?`
-    ).bind(visitorHash).first();
+        `SELECT visitor_hash, last_visit_day FROM visitor_stats WHERE visitor_hash = ? OR fingerprint = ? LIMIT 1`
+    ).bind(visitorHash, fingerprint).first();
 
     if (!existing) {
         // 新访客：插入 visitor_stats + 当日 unique_visitors +1
         await env.DB.prepare(
-            `INSERT INTO visitor_stats (visitor_hash, first_seen, last_seen, visit_count, last_ip, user_agent, user_name, last_visit_day)
-             VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+            `INSERT INTO visitor_stats (visitor_hash, fingerprint, first_seen, last_seen, visit_count, last_ip, user_agent, user_name, last_visit_day)
+             VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
              ON CONFLICT(visitor_hash) DO UPDATE SET last_seen = excluded.last_seen, visit_count = visit_count + 1,
                  last_ip = excluded.last_ip, user_name = excluded.user_name, last_visit_day = excluded.last_visit_day`
-        ).bind(visitorHash, now, now, cfIp, userAgent, userName || null, today).run();
+        ).bind(visitorHash, fingerprint, now, now, cfIp, userAgent, userName || null, today).run();
         await env.DB.prepare(
             `INSERT INTO visitor_daily (day, unique_visitors, total_visits) VALUES (?, 1, 1)
              ON CONFLICT(day) DO UPDATE SET total_visits = total_visits + 1`
@@ -540,8 +574,9 @@ async function runCleanup(env) {
         `DELETE FROM messages WHERE id NOT IN (SELECT id FROM messages ORDER BY timestamp DESC LIMIT 200)`
     ).run();
     await env.DB.prepare(`DELETE FROM online_users WHERE last_seen < ?`).bind(now - 600000).run();
+    // 默认三台 + 私有设备（宝宝手机）常驻；其余临时上报设备离线超 1 天回收
     await env.DB.prepare(
-        `DELETE FROM devices WHERE id NOT IN ('desktop','notebook','phone') AND last_seen < ?`
+        `DELETE FROM devices WHERE id NOT IN ('desktop','notebook','phone','宝宝手机') AND last_seen < ?`
     ).bind(now - DAY).run();
 
     // 字典 GC：删除不再被任何活动行引用的标题/vitals（防止字典随保留期推移无限增长）
@@ -707,6 +742,8 @@ async function listExternalModels(provider, baseUrl, apiKey) {
 // [API] 核心：聚合同步接口（Big JSON Mode）
 async function handleSync(request, env, url) {
     try {
+        // 私有设备（宝宝手机）仅登录后可见：未登录时从同步结果里剥掉该设备
+        const authed = !!(await authUser(env, request));
         const sinceId = parseInt(url.searchParams.get("since") || "0", 10);
         const msgStmt = sinceId > 0
             ? env.DB.prepare("SELECT * FROM messages WHERE id > ? ORDER BY timestamp ASC LIMIT 100").bind(sinceId)
@@ -723,6 +760,7 @@ async function handleSync(request, env, url) {
 
         const deviceData = { devices: {}, times: {}, lastSeen: {}, extra: {} };
         devicesRaw.forEach(d => {
+            if (!authed && isPrivateDeviceId(d.id)) return;
             let status = d.status || '系统在线';
             if (String(status).trim().toLowerCase() === 'online') status = '系统在线';
             deviceData.devices[d.id]  = status;
@@ -805,7 +843,8 @@ async function ingestReportBatch(env, deviceId, entries, now, timeStr, cfIp) {
 // [API] 设备上报：POST /api/report/{device_id}（body 为单对象或会话数组）
 async function handleReport(request, env, url) {
     try {
-        const deviceId = url.pathname.split("/").pop().toLowerCase();
+        // pathname 里中文等非 ASCII 设备 id 会被 percent-encode，需解码归一
+        const deviceId = decodePathDeviceId(url.pathname.split("/").pop());
         if (!deviceId) return createResponse("Invalid ID", 400);
 
         const rawBody = await request.text();
@@ -869,9 +908,14 @@ async function handleHistory(request, env, url) {
         const cursorTs  = parseInt(url.searchParams.get("cursorTs") || "0");
         const cursorId  = parseInt(url.searchParams.get("cursorId") || "0");
 
+        const authed = !!(await authUser(env, request));
         const where = [];
         const binds = [];
         const devs = (deviceId || "all").split(",").map(s => s.trim()).filter(Boolean);
+        // 私有设备（宝宝手机）仅登录可见：未登录却显式查该设备 → 401
+        if (!authed && devs.some(isPrivateDeviceId)) {
+            return createResponse(JSON.stringify({ error: "Unauthorized" }), 401);
+        }
         if (devs.length && !devs.includes("all")) {
             where.push(`ah.device_id IN (${devs.map(() => "?").join(",")})`);
             binds.push(...devs);
@@ -892,7 +936,11 @@ async function handleHistory(request, env, url) {
                      WHERE ${where.join(" AND ")}
                      ORDER BY ah.recorded_at DESC, ah.id DESC LIMIT ?`;
         binds.push(fetchLimit);
-        const rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
+        let rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
+        // 未登录 + 设备过滤为“all/无过滤”：滤掉私有设备行，保持访客视图不受影响
+        if (!authed && (!devs.length || devs.includes("all"))) {
+            rows = rows.filter(r => !isPrivateDeviceId(r.device_id));
+        }
 
         const history = [];
         let consumed = null;
@@ -949,8 +997,8 @@ async function handleHeartbeat(request, env, url) {
         // 访客统计：IP + 浏览器指纹组合哈希做去重
         if (fingerprint) {
             await ensureVisitorSchema(env);
-            const visitorHash = await sha256Hex(cfIp + '|' + fingerprint);
-            await recordVisitor(env, visitorHash, cfIp, ua.slice(0, 500), userName || null);
+            const visitorHash = await sha256Hex('fp|' + fingerprint);
+            await recordVisitor(env, visitorHash, fingerprint, cfIp, ua.slice(0, 500), userName || null);
         }
 
         const onlineRows = await env.DB.prepare(
@@ -1009,10 +1057,16 @@ async function handleAiSummary(request, env, url) {
 // [API] AI 合并数据：服务端无损合并区间内所有会话 + 汇总（给 AI 用，完整不截断）
 async function handleAiData(request, env, url) {
     try {
-        const devParam  = (url.searchParams.get("devices") || "all").toLowerCase();
+        const authed   = !!(await authUser(env, request));
+        const devParam = (url.searchParams.get("devices") || "all").toLowerCase();
         const startTime = parseInt(url.searchParams.get("start") || "0");
         const endTime   = parseInt(url.searchParams.get("end")   || String(Date.now()));
         const SAFETY    = 100000;   // 安全上限(远超正常用量)；命中则 complete=false 触发前端 map-reduce
+        // 私有设备（宝宝手机）仅登录可见
+        const devsParam = devParam.split(",").map(s => s.trim()).filter(Boolean);
+        if (!authed && devsParam.some(isPrivateDeviceId)) {
+            return createResponse(JSON.stringify({ error: "Unauthorized" }), 401);
+        }
 
         let sql, binds;
         if (devParam && devParam !== "all") {
@@ -1032,7 +1086,11 @@ async function handleAiData(request, env, url) {
                    ORDER BY ah.recorded_at ASC LIMIT ?`;
             binds = [startTime, endTime, SAFETY + 1];
         }
-        const rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
+        let rows = (await env.DB.prepare(sql).bind(...binds).all()).results || [];
+        // 未登录 + 设备过滤为“all/无过滤”：滤掉私有设备行
+        if (!authed && (devParam === "all" || !devsParam.length)) {
+            rows = rows.filter(r => !isPrivateDeviceId(r.device_id));
+        }
         const complete = rows.length <= SAFETY;
         if (!complete) rows.length = SAFETY;
         const cleanRows = rows.map(sanitizeActivityRow).filter(Boolean);
@@ -1089,6 +1147,7 @@ async function handleLogin(request, env, url) {
             token,
             username: row.username,
             profile: profileFromRow(row),
+            device: PRIVATE_DEVICE,
             expiresAt,
         }));
     } catch (err) {
@@ -1117,7 +1176,7 @@ async function handleGetAiConfig(request, env, url) {
         const row = await env.DB.prepare(
             `SELECT * FROM user_ai_profiles WHERE username = ?`
         ).bind(username).first();
-        return createResponse(JSON.stringify({ username, profile: profileFromRow(row) }));
+        return createResponse(JSON.stringify({ username, profile: profileFromRow(row), device: PRIVATE_DEVICE }));
     } catch (err) {
         return createResponse(JSON.stringify({ error: err.message }), 500);
     }
@@ -1150,7 +1209,7 @@ async function handlePostAiConfig(request, env, url) {
 
 // [API] 删除单个设备：DELETE /api/device/{id}
 async function handleDeleteDevice(request, env, url) {
-    const deviceId = url.pathname.split("/").pop().toLowerCase();
+    const deviceId = decodePathDeviceId(url.pathname.split("/").pop());
     await env.DB.prepare("DELETE FROM devices WHERE id = ?").bind(deviceId).run();
     return createResponse(JSON.stringify({ success: true, message: "Deleted " + deviceId }));
 }

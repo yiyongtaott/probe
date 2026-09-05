@@ -1,5 +1,6 @@
 import { ref } from 'vue'
 import { API_BASE, fmtDuration, devCode, getDeviceName } from '../utils/helpers'
+import { authHeaders } from './useAuth'
 
 const aiLoading = ref(false)
 const aiSummary = ref('')
@@ -21,7 +22,8 @@ export function useAi() {
   async function fetchAiData(devs, start, end) {
     try {
       const res = await fetch(
-        `${API_BASE}/api/ai-data?devices=${encodeURIComponent(devs)}&start=${start}&end=${end}`
+        `${API_BASE}/api/ai-data?devices=${encodeURIComponent(devs)}&start=${start}&end=${end}`,
+        { headers: authHeaders() }
       )
       if (!res.ok) return null
       return await res.json()

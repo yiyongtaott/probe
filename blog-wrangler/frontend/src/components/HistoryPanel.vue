@@ -1,12 +1,47 @@
 <script setup>
+import { computed, watch } from 'vue'
 import { useHistory } from '../composables/useHistory'
 import { useAi } from '../composables/useAi'
 import { useAuth } from '../composables/useAuth'
-import { getDeviceName, fmtHistoryDuration } from '../utils/helpers'
+import { chatState } from '../composables/useChat'
+import { getDeviceName, fmtHistoryDuration, BABY_DEVICE_ID, DEFAULT_PUBLIC_DEVICES } from '../utils/helpers'
 
 const history = useHistory()
 const ai = useAi()
 const auth = useAuth()
+
+// 设备筛选项：默认三台公共设备 + 登录后的私有设备（宝宝手机）
+const deviceOptions = computed(() => {
+  const list = DEFAULT_PUBLIC_DEVICES.map(id => ({ id, color: colorForDevice(id) }))
+  if (auth.authToken.value) list.push({ id: BABY_DEVICE_ID, color: 'text-pink-400' })
+  return list
+})
+
+function colorForDevice(d) {
+  if (d === 'desktop') return 'text-blue-400'
+  if (d === 'notebook') return 'text-purple-400'
+  if (d === 'phone') return 'text-cyan-400'
+  if (d === BABY_DEVICE_ID) return 'text-pink-400'
+  return 'text-slate-400'
+}
+
+// 登录/登出后调整设备选择并刷新（登录 → 加入宝宝手机；登出 → 移除并重新拉取公开数据）
+watch(() => auth.authToken.value, async (token, prev) => {
+  const current = history.historyDevices.value
+  if (token && !prev) {
+    if (!current.includes(BABY_DEVICE_ID)) {
+      history.historyDevices.value = [...current, BABY_DEVICE_ID]
+    }
+  } else if (!token && prev) {
+    if (current.includes(BABY_DEVICE_ID)) {
+      history.historyDevices.value = current.filter(id => id !== BABY_DEVICE_ID)
+    }
+  }
+  chatState.syncAllData()
+  if (history.historyRows.value.length > 0 || (history.historyDevices.value.length > 0 && token && !prev)) {
+    await loadAndPrepare(true)
+  }
+})
 
 // ── 桥接：加载历史 → 准备 AI 数据 ──
 async function loadAndPrepare(reset = true) {
@@ -76,16 +111,12 @@ function doFetchModels() {
           <div class="text-[10px] text-slate-500 mb-1 uppercase tracking-widest">设备</div>
           <div class="flex gap-2">
             <label
-              v-for="d in ['desktop','notebook','phone']"
-              :key="d"
+              v-for="opt in deviceOptions"
+              :key="opt.id"
               class="flex items-center gap-1 text-xs font-mono cursor-pointer"
             >
-              <input type="checkbox" :value="d" v-model="history.historyDevices.value" class="accent-purple-500" />
-              <span :class="{
-                'text-blue-400': d==='desktop',
-                'text-purple-400': d==='notebook',
-                'text-cyan-400': d==='phone'
-              }">{{ getDeviceName(d) }}</span>
+              <input type="checkbox" :value="opt.id" v-model="history.historyDevices.value" class="accent-purple-500" />
+              <span :class="opt.color">{{ getDeviceName(opt.id) }}</span>
             </label>
           </div>
         </div>
@@ -146,6 +177,12 @@ function doFetchModels() {
             <div class="text-[10px] text-slate-500 mb-1 uppercase tracking-widest">账号记忆</div>
             <div class="text-xs text-cyan-300 font-mono">
               已登录：{{ auth.authName.value || auth.authUser.value }}
+            </div>
+            <div
+              v-if="auth.authDevice.value"
+              class="text-xs text-pink-300 font-mono"
+            >
+              设备标识：{{ auth.authDevice.value }}
             </div>
           </div>
           <button
@@ -301,12 +338,7 @@ function doFetchModels() {
             <tr v-for="row in history.historyRows.value" :key="row.id">
               <td class="text-slate-600 whitespace-nowrap">{{ row.recorded_at ? new Date(row.recorded_at).toLocaleString('zh-CN', { hour12: false }) : '' }}</td>
               <td>
-                <span :class="{
-                  'text-blue-400': row.device_id==='desktop',
-                  'text-purple-400': row.device_id==='notebook',
-                  'text-cyan-400': row.device_id==='phone',
-                  'text-slate-400': !['desktop','notebook','phone'].includes(row.device_id)
-                }">{{ getDeviceName(row.device_id) }}</span>
+                <span :class="colorForDevice(row.device_id)">{{ getDeviceName(row.device_id) }}</span>
               </td>
               <td class="text-slate-300 max-w-xs truncate" :title="row.window_title">{{ row.window_title }}</td>
               <td class="text-slate-500 whitespace-nowrap">{{ fmtHistoryDuration(row) }}</td>

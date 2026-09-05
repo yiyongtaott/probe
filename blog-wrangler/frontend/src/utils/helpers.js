@@ -66,8 +66,12 @@ export function fmtHistoryDuration(row) {
 /**
  * 设备名称映射
  */
+export const DEFAULT_PUBLIC_DEVICES = ['desktop', 'notebook', 'phone']
+// 私有/绑定设备：仅登录后可见（账号的“宝宝手机”），固定为第 4 台设备
+// 与 blog-wrangler/src/worker-core.js 的 PRIVATE_DEVICE.id 保持一致
+export const BABY_DEVICE_ID = '宝宝手机'
 export function getDeviceName(id) {
-  const map = { desktop: '台式电脑', notebook: '笔记本电脑', phone: '手机' }
+  const map = { desktop: '台式电脑', notebook: '笔记本电脑', phone: '手机', [BABY_DEVICE_ID]: '宝宝手机' }
   return map[id] || (id && id.length > 10 ? id.substring(0, 8) + '...' : id || '未知')
 }
 
@@ -75,7 +79,7 @@ export function getDeviceName(id) {
  * 设备代号（单字，用于 AI prompt 紧凑表示）
  */
 export function devCode(id) {
-  return ({ desktop: '台', notebook: '笔', phone: '机' })[id] || id
+  return ({ desktop: '台', notebook: '笔', phone: '机', [BABY_DEVICE_ID]: '宝' })[id] || id
 }
 
 /**

@@ -49,7 +49,9 @@ object ProbeDeviceState {
         Thread {
             var conn: java.net.HttpURLConnection? = null
             try {
-                val url = java.net.URL("https://flandretiamat.dpdns.org/api/report/phone")
+                // 与 Dart 上报同一个设备名（由 --dart-define=device=xxx 编译期注入，默认 phone）
+                val deviceId = java.net.URLEncoder.encode(BuildConfig.DEVICE_ID, "UTF-8")
+                val url = java.net.URL("https://flandretiamat.dpdns.org/api/report/" + deviceId)
                 conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.connectTimeout = 6000

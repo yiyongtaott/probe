@@ -1,5 +1,6 @@
 import { ref, computed, nextTick } from 'vue'
 import { formatTime, formatInitLogTime, getCurrentTime, API_BASE, getDeviceName } from '../utils/helpers'
+import { authHeaders } from './useAuth'
 
 // ── 模块级状态（单例）──
 const chatInput = ref('')
@@ -63,7 +64,7 @@ async function syncAllData() {
   _syncing = true
   try {
     const since = lastMsgId.value || 0
-    const res = await fetch(API_BASE + '/api/sync?since=' + since)
+    const res = await fetch(API_BASE + '/api/sync?since=' + since, { headers: authHeaders() })
     if (res.ok) {
       const megaData = await res.json()
 

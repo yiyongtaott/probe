@@ -298,6 +298,12 @@ static BOOL is_reportable_title(const wchar_t *title, ULONGLONG dur) {
     if (!title || !title[0]) return FALSE;
     if (dur > 0 && dur < 1500ULL) return FALSE;
 
+    /* QQ/TIM main windows legitimately use a short repeated title (e.g. "QQ").
+       Keep these explicit app titles before the generic low-information filter. */
+    if (wcscmp(title, L"QQ") == 0 || wcscmp(title, L"qq") == 0 ||
+        wcscmp(title, L"TIM") == 0 || wcscmp(title, L"tim") == 0)
+        return TRUE;
+
     wchar_t lp[TITLE_CAP];
     to_lower_w(title, lp, TITLE_CAP);
     if (is_exact_low_value_title(lp)) return FALSE;

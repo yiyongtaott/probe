@@ -56,25 +56,25 @@ class DeviceInfo {
     'com.oplus.note': '便签',
   };
 
+  /// 编译期设备名覆盖：--dart-define=device=xxx
+  /// 优先于平台默认（Android/iOS 默认 'phone'），供“宝宝手机”等定制 APK 使用。
+  static const String _deviceDefine = String.fromEnvironment('device');
+
   static Future<String> detectDeviceId() async {
+    if (_deviceDefine.isNotEmpty) return _deviceDefine;
     try {
       if (Platform.isWindows) return _detectWindowsDeviceId();
       if (Platform.isAndroid || Platform.isIOS) return 'phone';
     } catch (_) {}
-
-    const dartDefine = String.fromEnvironment('device');
-    if (dartDefine.isNotEmpty) return dartDefine;
     return 'notebook';
   }
 
   static String detectDeviceIdSync() {
+    if (_deviceDefine.isNotEmpty) return _deviceDefine;
     try {
       if (Platform.isWindows) return _detectWindowsDeviceId();
       if (Platform.isAndroid || Platform.isIOS) return 'phone';
     } catch (_) {}
-
-    const dartDefine = String.fromEnvironment('device');
-    if (dartDefine.isNotEmpty) return dartDefine;
     return 'notebook';
   }
 

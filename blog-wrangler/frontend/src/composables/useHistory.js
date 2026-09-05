@@ -1,8 +1,16 @@
 import { ref } from 'vue'
-import { API_BASE, fmtHistoryDuration } from '../utils/helpers'
+import { API_BASE, fmtHistoryDuration, BABY_DEVICE_ID, DEFAULT_PUBLIC_DEVICES } from '../utils/helpers'
+import { authHeaders } from './useAuth'
+
+// 已登录（本地已有 token）时默认把私有设备（宝宝手机）一并选中
+function defaultHistoryDevices() {
+  const base = [...DEFAULT_PUBLIC_DEVICES]
+  if (localStorage.getItem('fl_auth_token')) base.push(BABY_DEVICE_ID)
+  return base
+}
 
 const historyPanelOpen = ref(true)
-const historyDevices = ref(['desktop', 'notebook', 'phone'])
+const historyDevices = ref(defaultHistoryDevices())
 const historyRange = ref('86400000')
 const historyRows = ref([])
 const historyLoading = ref(false)
@@ -39,7 +47,7 @@ export function useHistory() {
         params.set('cursorTs', String(historyCursor.value.ts))
         params.set('cursorId', String(historyCursor.value.id))
       }
-      const res = await fetch(API_BASE + '/api/history?' + params.toString())
+      const res = await fetch(API_BASE + '/api/history?' + params.toString(), { headers: authHeaders() })
       if (!res.ok) throw new Error('HTTP ' + res.status)
       const data = await res.json()
       historyRows.value = data.history || []

@@ -512,10 +512,9 @@ packages:
   workmanager:
     dependency: "direct main"
     description:
-      name: workmanager
-      sha256: "746a50c535af15b6dc225abbd9b52ab272bcd292c535a104c54b5bc02609c38a"
-      url: "https://pub.dev"
-    source: hosted
+      path: "third_party/workmanager"
+      relative: true
+    source: path
     version: "0.7.0"
   xdg_directories:
     dependency: transitive

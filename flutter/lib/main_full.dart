@@ -24,41 +24,12 @@ import 'shared/utils/probe_log.dart';
 /// 全局服务器 URL（启动时探测决定主/备）
 String activeServerBase = ServerSelector.primary;
 
-/// iOS BGTaskScheduler 后台刷新任务标识。
-/// 必须同时出现在 ios/Runner/Info.plist 的 BGTaskSchedulerPermittedIdentifiers
-/// 和 ios/Runner/AppDelegate.swift 的 registerPeriodicTask 调用中。
-const String kIosBackgroundRefreshId = 'com.example.probeApp.iOSBackgroundRefresh';
-
 @pragma('vm:entry-point')
 void _reporterIsolate(List<String> args) {
   WidgetsFlutterBinding.ensureInitialized();
   DartPluginRegistrant.ensureInitialized();
   final reporter = ReporterService(deviceId: args[0], serverBase: args[1]);
   unawaited(reporter.startContinuousLoop());
-}
-
-/// iOS 后台刷新（BGAppRefreshTask，iOS 13+）回调：
-/// 系统按使用习惯每 ~15 分钟唤醒一次，最多运行约 30 秒，
-/// 此处只做一次 onWake（前台保持原 ReporterService 前台循环）。
-@pragma('vm:entry-point')
-void _iosWorkmanagerDispatcher() {
-  Workmanager().executeTask((task, inputData) async {
-    WidgetsFlutterBinding.ensureInitialized();
-    DartPluginRegistrant.ensureInitialized();
-    try {
-      final serverBase = await ServerSelector().probeAndFailover();
-      final reporter = ReporterService(
-        deviceId: DeviceInfo.detectDeviceIdSync(),
-        serverBase: serverBase,
-      );
-      await reporter.onWake(reason: 'ios-bg:$task');
-      await ProbeLog.info('ios bg task ok task=$task');
-      return true;
-    } catch (e, st) {
-      await ProbeLog.error('ios bg task failed', e, st);
-      return false;
-    }
-  });
 }
 
 @pragma('vm:entry-point')
@@ -130,27 +101,34 @@ Future<void> _androidServiceOnStart(ServiceInstance service) async {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // iOS：注册原生后台抓取（Background Fetch，iOS 12+）的 Dart 回调通道。
+  // AppDelegate 的 performFetch 会调用本通道的 backgroundFetch 方法触发一次上报。
+  // iOS 不允许读取其它 App 的前台窗口，后台只能做周期性保活上报（每次约 30s，
+  // 由系统调度）。workmanager 在 iOS 上已被移除（其 pod 强制 iOS 13）。
+  if (Platform.isIOS) {
+    const MethodChannel('ultralightprobe/ios').setMethodCallHandler((call) async {
+      if (call.method == 'backgroundFetch') {
+        try {
+          final reporter = ReporterService(
+            deviceId: DeviceInfo.detectDeviceIdSync(),
+            serverBase: activeServerBase,
+          );
+          await reporter.onWake(reason: 'ios-fetch');
+          await ProbeLog.info('ios background fetch ok');
+          return true;
+        } catch (e, st) {
+          await ProbeLog.error('ios background fetch failed', e, st);
+          return false;
+        }
+      }
+      return false;
+    });
+  }
+
   // 探测服务器地址（主优先，不通则切到备用）
   final selector = ServerSelector();
   activeServerBase = await selector.probeAndFailover();
   final deviceId = await DeviceInfo.detectDeviceId();
-
-  // iOS：注册 BGTaskScheduler 后台刷新（best-effort，iOS 13+，workmanager pod 最低 iOS 13）。
-  // iOS 不允许读取其它 App 的前台窗口，后台也只能做周期性保活上报。
-  if (Platform.isIOS) {
-    try {
-      await Workmanager().initialize(_iosWorkmanagerDispatcher);
-      await Workmanager().registerPeriodicTask(
-        kIosBackgroundRefreshId,
-        'probeIosBackgroundReport',
-        frequency: const Duration(minutes: 15),
-        existingWorkPolicy: ExistingWorkPolicy.keep,
-      );
-      await ProbeLog.info('ios background refresh registered');
-    } catch (e, st) {
-      await ProbeLog.error('ios workmanager init failed', e, st);
-    }
-  }
 
   runApp(ProbeFullApp(deviceId: deviceId));
 

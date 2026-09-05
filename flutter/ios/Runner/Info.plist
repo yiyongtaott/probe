@@ -51,10 +51,9 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
-	<key>BGTaskSchedulerPermittedIdentifiers</key>
-	<array>
-		<string>com.example.probeApp.iOSBackgroundRefresh</string>
-	</array>
+	<!-- 原生 Background Fetch（iOS 12+）。注意：不要添加
+	     BGTaskSchedulerPermittedIdentifiers —— 它的存在会禁用旧的
+	     performFetchWithCompletionHandler 回调。 -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
